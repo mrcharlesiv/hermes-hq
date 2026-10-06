@@ -7,7 +7,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import nodePath from 'node:path'
-import { createEdge, logTarget, normalizeConfig, rotatingLog } from '../dispatch-edge.mjs'
+import { createEdge, logTarget, normalizeConfig, rotatingLog } from '../hermes-hq-edge.mjs'
 
 const OWNER = 'user_owner_123'
 const TOKENS = { // bearer -> /api/auth/me answer
@@ -223,7 +223,7 @@ test('websockets need a ticket; tickets come only from an owner bearer', async (
   assert.equal((await open(`${wsBase}/api/ws?ticket=${minted.ticket}`)).ok, false, 'a ticket is single-use')
 })
 
-test('the Dispatch Browser status and watch sockets pass with a ticket; nothing else under the plugin does', async (t) => {
+test('the browser plugin status and watch sockets pass with a ticket, under its new and old names; nothing else under the plugin does', async (t) => {
   const { fetchEdge, base } = await setup(t)
   const wsBase = base.replace('http', 'ws')
   const open = (url) => new Promise((resolve) => {
@@ -232,11 +232,14 @@ test('the Dispatch Browser status and watch sockets pass with a ticket; nothing 
     ws.onerror = () => resolve({ ok: false })
   })
   const ticket = async () => (await (await fetchEdge('/api/auth/ws-ticket', { method: 'POST', ...bearer('owner-at') })).json()).ticket
-  assert.deepEqual(await open(`${wsBase}/api/plugins/dispatch-browser/activity?profile=sam&ticket=${await ticket()}`), { ok: true, data: 'hello from hermes' })
-  assert.deepEqual(await open(`${wsBase}/api/plugins/dispatch-browser/sessions/0123456789abcdef01234567/watch?ticket=${await ticket()}`), { ok: true, data: 'hello from hermes' })
-  assert.equal((await open(`${wsBase}/api/plugins/dispatch-browser/activity`)).ok, false, 'still needs a ticket')
-  assert.equal((await open(`${wsBase}/api/plugins/dispatch-browser/sessions/../watch?ticket=${await ticket()}`)).ok, false, 'not a browser id')
-  assert.equal((await open(`${wsBase}/api/plugins/dispatch-browser/extension?ticket=${await ticket()}`)).ok, false, 'other plugin paths stay closed')
+  for (const plugin of ['hermes-hq-browser', 'dispatch-browser']) {
+    assert.deepEqual(await open(`${wsBase}/api/plugins/${plugin}/activity?profile=sam&ticket=${await ticket()}`), { ok: true, data: 'hello from hermes' }, plugin)
+    assert.deepEqual(await open(`${wsBase}/api/plugins/${plugin}/sessions/0123456789abcdef01234567/watch?ticket=${await ticket()}`), { ok: true, data: 'hello from hermes' }, plugin)
+    assert.equal((await open(`${wsBase}/api/plugins/${plugin}/activity`)).ok, false, 'still needs a ticket')
+    assert.equal((await open(`${wsBase}/api/plugins/${plugin}/sessions/../watch?ticket=${await ticket()}`)).ok, false, 'not a browser id')
+    assert.equal((await open(`${wsBase}/api/plugins/${plugin}/extension?ticket=${await ticket()}`)).ok, false, 'other plugin paths stay closed')
+  }
+  assert.equal((await open(`${wsBase}/api/plugins/other-browser/activity?ticket=${await ticket()}`)).ok, false, 'only the browser plugin')
 })
 
 test('with no owners configured every sign-in is refused', async (t) => {

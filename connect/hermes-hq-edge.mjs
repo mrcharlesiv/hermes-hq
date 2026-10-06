@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// Dispatch edge: the only door from a public URL (Tailscale Funnel) to a Mac-hosted Hermes gateway.
+// Hermes HQ edge: the only door from a public URL (Tailscale Funnel) to a Mac-hosted Hermes gateway.
 //
 // Hermes's Nous provider accepts any token Portal mints for this dashboard's client id; it never asks *which*
 // Nous account signed in, and the same process also runs the shared username/password login. This process
 // sits between Funnel and Hermes and lets through only:
-//   - the public probes Dispatch reads before sign-in (/api/health, /api/status);
+//   - the public probes Hermes HQ reads before sign-in (/api/health, /api/status);
 //   - the RFC 8252 native sign-in, pinned to the Nous provider (/auth/native/authorize, /auth/callback);
 //   - the native token and refresh answers, and only when they name an owner's Nous account;
 //   - requests carrying an owner's Nous bearer token (checked with Hermes's own /api/auth/me);
@@ -12,7 +12,7 @@
 // No cookie session, no password login, no session token: cookies are stripped both ways except the one-shot
 // PKCE cookie of a sign-in in progress. Nothing secret is ever logged (no query strings, headers or bodies).
 //
-// No dependencies: node >= 20. Usage: node dispatch-edge.mjs <config.json>   (see README.md)
+// No dependencies: node >= 20. Usage: node hermes-hq-edge.mjs <config.json>   (see README.md)
 
 import http from 'node:http'
 import net from 'node:net'
@@ -23,9 +23,10 @@ import { pathToFileURL } from 'node:url'
 
 const PUBLIC_GET = new Set(['/api/health', '/api/status'])
 const TOKEN_ROUTES = new Set(['/auth/native/token', '/auth/native/refresh'])
-// Dispatch Browser's status list and one bot browser's live view (gateway-plugin/dispatch-browser), like the Bot Screen.
+// The browser plugin's status list and one bot browser's live view (gateway-plugin/hermes-hq-browser), like the Bot
+// Screen. Gateways still running the plugin under its old name (dispatch-browser) serve the same sockets there.
 const WS_PATHS = [/^\/api\/ws$/, /^\/api\/display\/ws$/, /^\/api\/audio\/[A-Za-z0-9_\-/]+$/,
-  /^\/api\/plugins\/dispatch-browser\/activity$/, /^\/api\/plugins\/dispatch-browser\/sessions\/[0-9a-f]{24}\/watch$/]
+  /^\/api\/plugins\/(hermes-hq|dispatch)-browser\/activity$/, /^\/api\/plugins\/(hermes-hq|dispatch)-browser\/sessions\/[0-9a-f]{24}\/watch$/]
 const PKCE_COOKIE = /^(__Host-|__Secure-)?hermes_session_pkce$/
 // Client headers never forwarded: hop-by-hop, ambient credentials, and anything that claims a client identity.
 const DROP_REQUEST = new Set(['host', 'cookie', 'authorization', 'connection', 'keep-alive', 'proxy-authorization',
@@ -245,7 +246,7 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
     send(res, 200, payload)
   }
 
-  /** Hermes's public status, saying what this door offers: only Nous native sign-in. Dispatch's sign-in form reads it
+  /** Hermes's public status, saying what this door offers: only Nous native sign-in. Hermes HQ's sign-in form reads it
    *  to show Sign in with Nous alone, never password fields the edge would refuse. */
   async function publicStatus(req, res) {
     const answer = await call('GET', '/api/status')
@@ -376,7 +377,7 @@ export function rotatingLog(file, { maxBytes = LOG_MAX_BYTES } = {}) {
 }
 
 /** Where the log goes: the config's `logFile`, or the file launchd sends stderr to when it's edge.log beside the
- *  config (com.dispatch.edge.plist and dispatch-connect set it up that way), written by name so it can rotate. */
+ *  config (com.hermes-hq.edge.plist and hermes-hq-connect set it up that way), written by name so it can rotate. */
 export function logTarget(cfg, configFile) {
   if (cfg.logFile) return cfg.logFile
   const beside = nodePath.join(nodePath.dirname(configFile), 'edge.log')
@@ -389,12 +390,12 @@ export function logTarget(cfg, configFile) {
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const file = process.argv[2]
-  if (!file) { console.error('usage: node dispatch-edge.mjs <config.json>'); process.exit(64) }
+  if (!file) { console.error('usage: node hermes-hq-edge.mjs <config.json>'); process.exit(64) }
   const cfg = loadConfig(file)
   if (!['127.0.0.1', '::1'].includes(cfg.listenHost)) { console.error('refusing to listen beyond loopback: Funnel is the public side'); process.exit(78) }
-  if (cfg.owners.size === 0) console.error('dispatch-edge: no owners configured — every sign-in will be refused (its Nous account id is logged so you can add it)')
+  if (cfg.owners.size === 0) console.error('hermes-hq-edge: no owners configured — every sign-in will be refused (its Nous account id is logged so you can add it)')
   const logFile = logTarget(cfg, file)
   createEdge(cfg, logFile ? { log: rotatingLog(logFile) } : {}).listen(cfg.listenPort, cfg.listenHost, () => {
-    console.error(`dispatch-edge: listening on http://${cfg.listenHost}:${cfg.listenPort} → ${cfg.upstream.origin} (${cfg.owners.size} owner${cfg.owners.size === 1 ? '' : 's'})`)
+    console.error(`hermes-hq-edge: listening on http://${cfg.listenHost}:${cfg.listenPort} → ${cfg.upstream.origin} (${cfg.owners.size} owner${cfg.owners.size === 1 ? '' : 's'})`)
   })
 }

@@ -1,4 +1,4 @@
-// A small QR Code encoder (byte mode, error correction level M, versions 1–15) for dispatch-connect's terminal
+// A small QR Code encoder (byte mode, error correction level M, versions 1–15) for hermes-hq-connect's terminal
 // handoff, with no dependencies. Follows ISO/IEC 18004 the way Project Nayuki's reference implementation does:
 // Reed–Solomon over GF(256), interleaved blocks, the eight masks scored by the standard penalty rules.
 
