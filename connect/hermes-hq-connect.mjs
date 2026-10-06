@@ -402,7 +402,8 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const args = process.argv.slice(2)
   const command = args.find((a) => !a.startsWith('-')) ?? 'setup'
   const deps = systemDeps()
-  const work = command === 'status' ? status(deps) : command === 'off' ? off(deps) : command === 'setup' ? setup(deps, { dryRun: args.includes('--dry-run') }) : null
+  // An unknown flag (--help, a typo) prints usage instead of running setup.
+  const work = args.some((a) => a.startsWith('-') && a !== '--dry-run') ? null : command === 'status' ? status(deps) : command === 'off' ? off(deps) : command === 'setup' ? setup(deps, { dryRun: args.includes('--dry-run') }) : null
   if (!work) { console.error('usage: node hermes-hq-connect.mjs [setup|status|off] [--dry-run]'); process.exit(64) }
   work.catch((error) => {
     if (error instanceof Stop) { console.error('\n' + error.message); process.exit(error.code) }
