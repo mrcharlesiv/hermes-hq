@@ -18,11 +18,14 @@ import http from 'node:http'
 import net from 'node:net'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import nodePath from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const PUBLIC_GET = new Set(['/api/health', '/api/status'])
 const TOKEN_ROUTES = new Set(['/auth/native/token', '/auth/native/refresh'])
-const WS_PATHS = [/^\/api\/ws$/, /^\/api\/display\/ws$/, /^\/api\/audio\/[A-Za-z0-9_\-/]+$/]
+// Dispatch Browser's status list and one bot browser's live view (gateway-plugin/dispatch-browser), like the Bot Screen.
+const WS_PATHS = [/^\/api\/ws$/, /^\/api\/display\/ws$/, /^\/api\/audio\/[A-Za-z0-9_\-/]+$/,
+  /^\/api\/plugins\/dispatch-browser\/activity$/, /^\/api\/plugins\/dispatch-browser\/sessions\/[0-9a-f]{24}\/watch$/]
 const PKCE_COOKIE = /^(__Host-|__Secure-)?hermes_session_pkce$/
 // Client headers never forwarded: hop-by-hop, ambient credentials, and anything that claims a client identity.
 const DROP_REQUEST = new Set(['host', 'cookie', 'authorization', 'connection', 'keep-alive', 'proxy-authorization',
@@ -30,6 +33,12 @@ const DROP_REQUEST = new Set(['host', 'cookie', 'authorization', 'connection', '
 const DROP_RESPONSE = new Set(['connection', 'keep-alive', 'transfer-encoding', 'set-cookie'])
 const MAX_AUTH_BODY = 16 * 1024
 const AUTH_CACHE_MS = 60_000
+// An upstream that hasn't started answering by then is given up (a stream, once answering, runs as long as it lasts).
+const UPSTREAM_ANSWER_MS = 300_000
+// Decisions that are the edge working as meant: counted and logged once an hour, not a line per request.
+const ROUTINE = new Set(['owner', 'public', 'ws-relayed'])
+const SUMMARY_MS = 3_600_000
+const LOG_MAX_BYTES = 5 * 1024 * 1024
 
 export function loadConfig(file) {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
@@ -44,6 +53,7 @@ export function normalizeConfig(raw) {
   return {
     listenHost: raw.listen?.host ?? '127.0.0.1',
     listenPort: Number(raw.listen?.port ?? 9139),
+    logFile: raw.logFile ? String(raw.logFile) : null,
     upstream,
     owners: new Set(owners),
     provider: raw.provider ?? 'nous',
@@ -54,16 +64,18 @@ export function normalizeConfig(raw) {
 
 const sha = (text) => crypto.createHash('sha256').update(text).digest('hex')
 
-/** A sliding-window counter per key. */
+/** A sliding-window counter per key. Each key keeps at most max + 1 times, however hard it's hit (a flood
+ *  costs the same memory and work as being one over the limit). */
 function limiter(windowMs, max, now) {
   const hits = new Map()
   return {
     hit(key) {
       const t = now(), list = (hits.get(key) ?? []).filter((at) => t - at < windowMs)
-      list.push(t); hits.set(key, list)
+      list.push(t); hits.set(key, list.length > max + 1 ? list.slice(-(max + 1)) : list)
       if (hits.size > 10_000) for (const [k, v] of hits) if (!v.some((at) => t - at < windowMs)) hits.delete(k)
       return list.length > max
     },
+    size(key) { return hits.get(key)?.length ?? 0 },
     over(key) { return (hits.get(key) ?? []).filter((at) => now() - at < windowMs).length >= max },
   }
 }
@@ -96,7 +108,15 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
     return forwarded || peer
   }
 
+  // Routine decisions are counted, and logged as one summary line an hour; everything else is a line of its own.
+  let routine = {}, routineSince = now()
+  function flushRoutine() {
+    if (Object.keys(routine).length) log({ t: new Date(now()).toISOString(), decision: 'summary', since: new Date(routineSince).toISOString(), counts: routine })
+    routine = {}; routineSince = now()
+  }
   function record(req, status, decision, extra = {}) {
+    if (now() - routineSince >= SUMMARY_MS) flushRoutine()
+    if (ROUTINE.has(decision)) { routine[decision] = (routine[decision] ?? 0) + 1; return }
     log({ t: new Date(now()).toISOString(), ip: clientIp(req), method: req.method, path: pathOf(req.url), status, decision, ...extra })
   }
 
@@ -130,15 +150,31 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
     res.end(text)
   }
 
-  /** Streams the request to Hermes and its answer back (no cookies either way unless `keepCookie` allows). */
+  /** Streams the request to Hermes and its answer back (no cookies either way unless `keepCookie` allows). The
+   *  upstream request ends with the client's: a phone that went away doesn't leave Hermes streaming to nobody. */
   function proxy(req, res, { path = req.url, bearer = null, cookies = null, keepCookie, decision }) {
+    let answered = false
     const upstreamReq = client.request({ protocol: cfg.upstream.protocol, hostname: cfg.upstream.hostname, port: cfg.upstream.port,
       method: req.method, path, headers: forwardHeaders(req, { bearer, cookies }) }, (upstreamRes) => {
+      answered = true
+      clearTimeout(waiting)
       res.writeHead(upstreamRes.statusCode ?? 502, responseHeaders(upstreamRes, { keepCookie }))
+      upstreamRes.on('error', () => res.destroy())
       upstreamRes.pipe(res)
       record(req, upstreamRes.statusCode, decision)
     })
-    upstreamReq.on('error', () => { send(res, 502, { error: 'upstream_unreachable' }); record(req, 502, 'upstream-error') })
+    const waiting = setTimeout(() => {
+      upstreamReq.destroy()
+      send(res, 504, { error: 'upstream_timeout' }); record(req, 504, 'upstream-timeout')
+    }, UPSTREAM_ANSWER_MS)
+    waiting.unref?.()
+    upstreamReq.on('error', () => {
+      clearTimeout(waiting)
+      if (res.writableEnded) return
+      if (answered) return res.destroy()
+      send(res, 502, { error: 'upstream_unreachable' }); record(req, 502, 'upstream-error')
+    })
+    res.on('close', () => { clearTimeout(waiting); if (!res.writableFinished) upstreamReq.destroy() })
     req.pipe(upstreamReq)
   }
 
@@ -272,13 +308,15 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
     }
   })
 
-  server.on('upgrade', (req, socket, head) => {
+  server.on('upgrade', async (req, socket, head) => {
     const url = new URL(req.url, 'http://edge.invalid')
     const deny = (status, decision) => {
       record(req, status, decision)
       socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
     }
-    if (gated !== true) return deny(503, 'upstream-gate-off')
+    // A gate seen off (or not yet) is asked again, as HTTP requests do: a Hermes restart doesn't refuse sockets until the next tick.
+    socket.on('error', () => socket.destroy())
+    if (gated !== true && !(await checkGate().catch(() => false))) return deny(503, 'upstream-gate-off')
     if (!WS_PATHS.some((re) => re.test(url.pathname))) return deny(404, 'ws-path-blocked')
     // Session tokens and the server-internal credential never come from outside; a ticket is the only credential.
     if (url.searchParams.has('token') || url.searchParams.has('internal')) return deny(401, 'ws-credential-blocked')
@@ -302,8 +340,9 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
   const gateTimer = setInterval(() => { checkGate().catch(() => { gated = false }) }, 60_000)
   gateTimer.unref?.()
   checkGate().catch(() => { gated = false })
-  server.on('close', () => clearInterval(gateTimer))
+  server.on('close', () => { clearInterval(gateTimer); flushRoutine() })
   server.checkGate = checkGate
+  server.limits = { authorize: authorizeLimit, failures: failureLimit }
   server.edgeConfig = cfg
   return server
 }
@@ -321,13 +360,41 @@ function safeError(answer) {
 
 function defaultLog(entry) { process.stderr.write(JSON.stringify(entry) + '\n') }
 
+/** Appends JSON lines to `file`, moving it to `file.1` (replacing the last one) when it reaches `maxBytes`: the log
+ *  of an always-on LaunchAgent can't grow forever. */
+export function rotatingLog(file, { maxBytes = LOG_MAX_BYTES } = {}) {
+  let size = 0
+  try { size = fs.statSync(file).size } catch {}
+  return (entry) => {
+    const line = JSON.stringify(entry) + '\n'
+    try {
+      if (size > 0 && size + Buffer.byteLength(line) > maxBytes) { fs.renameSync(file, file + '.1'); size = 0 }
+      fs.appendFileSync(file, line, { mode: 0o600 })
+      size += Buffer.byteLength(line)
+    } catch { process.stderr.write(line) }
+  }
+}
+
+/** Where the log goes: the config's `logFile`, or the file launchd sends stderr to when it's edge.log beside the
+ *  config (com.dispatch.edge.plist and dispatch-connect set it up that way), written by name so it can rotate. */
+export function logTarget(cfg, configFile) {
+  if (cfg.logFile) return cfg.logFile
+  const beside = nodePath.join(nodePath.dirname(configFile), 'edge.log')
+  try {
+    const err = fs.fstatSync(2), file = fs.statSync(beside)
+    if (err.isFile() && err.ino === file.ino && err.dev === file.dev) return beside
+  } catch {}
+  return null
+}
+
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const file = process.argv[2]
   if (!file) { console.error('usage: node dispatch-edge.mjs <config.json>'); process.exit(64) }
   const cfg = loadConfig(file)
   if (!['127.0.0.1', '::1'].includes(cfg.listenHost)) { console.error('refusing to listen beyond loopback: Funnel is the public side'); process.exit(78) }
   if (cfg.owners.size === 0) console.error('dispatch-edge: no owners configured — every sign-in will be refused (its Nous account id is logged so you can add it)')
-  createEdge(cfg).listen(cfg.listenPort, cfg.listenHost, () => {
+  const logFile = logTarget(cfg, file)
+  createEdge(cfg, logFile ? { log: rotatingLog(logFile) } : {}).listen(cfg.listenPort, cfg.listenHost, () => {
     console.error(`dispatch-edge: listening on http://${cfg.listenHost}:${cfg.listenPort} → ${cfg.upstream.origin} (${cfg.owners.size} owner${cfg.owners.size === 1 ? '' : 's'})`)
   })
 }

@@ -4,7 +4,10 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import crypto from 'node:crypto'
-import { createEdge } from '../dispatch-edge.mjs'
+import fs from 'node:fs'
+import os from 'node:os'
+import nodePath from 'node:path'
+import { createEdge, logTarget, normalizeConfig, rotatingLog } from '../dispatch-edge.mjs'
 
 const OWNER = 'user_owner_123'
 const TOKENS = { // bearer -> /api/auth/me answer
@@ -21,6 +24,7 @@ const CODES = { // native code -> issued session
 function fakeHermes({ gated = true } = {}) {
   const seen = []
   const tickets = new Set()
+  const state = { gated, streamClosed: false }
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x')
     let body = ''
@@ -32,7 +36,15 @@ function fakeHermes({ gated = true } = {}) {
       const me = bearer && TOKENS[bearer]
       switch (url.pathname) {
         case '/api/health': return json(200, { ok: true })
-        case '/api/status': return json(200, { auth_required: gated, auth_providers: ['basic', 'nous'], auth_flows: ['cookie', 'native_pkce'] })
+        case '/api/status': return json(200, { auth_required: state.gated, auth_providers: ['basic', 'nous'], auth_flows: ['cookie', 'native_pkce'] })
+        case '/api/stream': {
+          // A long answer that keeps going until somebody hangs up.
+          if (!me) return json(401, { error: 'unauthenticated' })
+          res.writeHead(200, { 'content-type': 'text/event-stream' })
+          const tick = setInterval(() => res.write('data: tick\n\n'), 20)
+          res.on('close', () => { clearInterval(tick); state.streamClosed = true })
+          return
+        }
         case '/auth/native/authorize':
           return json(302, {}, { location: 'https://portal.example/oauth/authorize?x=1', 'set-cookie': ['hermes_session_pkce=abc; HttpOnly; Path=/', 'hermes_session_at=leak; Path=/'] })
         case '/auth/callback':
@@ -70,14 +82,14 @@ function fakeHermes({ gated = true } = {}) {
     const text = Buffer.from('hello from hermes')
     socket.write(Buffer.concat([Buffer.from([0x81, text.length]), text]))
   })
-  return { server, seen, tickets }
+  return { server, seen, tickets, state }
 }
 
-async function setup(t, { owners = [OWNER], gated = true } = {}) {
+async function setup(t, { owners = [OWNER], gated = true, now } = {}) {
   const hermes = fakeHermes({ gated })
   await new Promise((r) => hermes.server.listen(0, '127.0.0.1', r))
   const logs = []
-  const edge = createEdge({ upstream: `http://127.0.0.1:${hermes.server.address().port}`, owners }, { log: (e) => logs.push(e) })
+  const edge = createEdge({ upstream: `http://127.0.0.1:${hermes.server.address().port}`, owners }, { log: (e) => logs.push(e), ...(now ? { now } : {}) })
   await new Promise((r) => edge.listen(0, '127.0.0.1', r))
   // Upgraded sockets are no longer the servers' to close: track every connection and end them all.
   const open = new Set()
@@ -211,6 +223,22 @@ test('websockets need a ticket; tickets come only from an owner bearer', async (
   assert.equal((await open(`${wsBase}/api/ws?ticket=${minted.ticket}`)).ok, false, 'a ticket is single-use')
 })
 
+test('the Dispatch Browser status and watch sockets pass with a ticket; nothing else under the plugin does', async (t) => {
+  const { fetchEdge, base } = await setup(t)
+  const wsBase = base.replace('http', 'ws')
+  const open = (url) => new Promise((resolve) => {
+    const ws = new WebSocket(url)
+    ws.onmessage = (e) => { resolve({ ok: true, data: String(e.data) }); ws.close() }
+    ws.onerror = () => resolve({ ok: false })
+  })
+  const ticket = async () => (await (await fetchEdge('/api/auth/ws-ticket', { method: 'POST', ...bearer('owner-at') })).json()).ticket
+  assert.deepEqual(await open(`${wsBase}/api/plugins/dispatch-browser/activity?profile=sam&ticket=${await ticket()}`), { ok: true, data: 'hello from hermes' })
+  assert.deepEqual(await open(`${wsBase}/api/plugins/dispatch-browser/sessions/0123456789abcdef01234567/watch?ticket=${await ticket()}`), { ok: true, data: 'hello from hermes' })
+  assert.equal((await open(`${wsBase}/api/plugins/dispatch-browser/activity`)).ok, false, 'still needs a ticket')
+  assert.equal((await open(`${wsBase}/api/plugins/dispatch-browser/sessions/../watch?ticket=${await ticket()}`)).ok, false, 'not a browser id')
+  assert.equal((await open(`${wsBase}/api/plugins/dispatch-browser/extension?ticket=${await ticket()}`)).ok, false, 'other plugin paths stay closed')
+})
+
 test('with no owners configured every sign-in is refused', async (t) => {
   const { fetchEdge } = await setup(t, { owners: [] })
   assert.equal((await fetchEdge('/auth/native/token', post({ code: 'owner-code', code_verifier: 'v' }))).status, 403)
@@ -232,4 +260,63 @@ test("a Hermes whose own auth gate is off is never served (loopback bind)", asyn
   assert.equal((await fetchEdge('/auth/native/token', post({ code: 'owner-code', code_verifier: 'v' }))).status, 503)
   const ws = await new Promise((resolve) => { const s = new WebSocket(base.replace('http', 'ws') + '/api/ws?ticket=x'); s.onopen = () => resolve(true); s.onerror = () => resolve(false) })
   assert.equal(ws, false)
+})
+
+test('routine requests are counted in an hourly summary line, not logged one by one (X-15)', async (t) => {
+  let clock = Date.now()
+  const { fetchEdge, logs } = await setup(t, { now: () => clock })
+  for (let i = 0; i < 5; i++) assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200)
+  await fetchEdge('/api/health')
+  assert.equal((await fetchEdge('/api/env', bearer('stranger-at'))).status, 403)
+  assert.ok(!logs.some((e) => e.decision === 'owner' || e.decision === 'public'), 'no line per routine request')
+  assert.ok(logs.some((e) => e.decision === 'not-owner'), 'refusals are still a line each')
+  clock += 3_600_000
+  await fetchEdge('/api/health')
+  const summary = logs.find((e) => e.decision === 'summary')
+  assert.deepEqual(summary.counts, { owner: 5, public: 1 }) // the request that flushed it starts the next hour
+})
+
+test('the log rotates instead of growing forever, and the launchd file is found (X-15)', () => {
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'edge-log-'))
+  const file = nodePath.join(dir, 'edge.log')
+  const log = rotatingLog(file, { maxBytes: 200 })
+  for (let i = 0; i < 10; i++) log({ i, decision: 'not-owner', path: '/api/env' })
+  assert.ok(fs.statSync(file).size <= 200)
+  assert.ok(fs.existsSync(file + '.1'))
+  assert.equal(fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line).i).at(-1), 9)
+  assert.equal(logTarget(normalizeConfig({ upstream: 'http://127.0.0.1:9119', logFile: file }), nodePath.join(dir, 'config.json')), file)
+  // stderr here isn't that file, so nothing is guessed.
+  assert.equal(logTarget(normalizeConfig({ upstream: 'http://127.0.0.1:9119' }), nodePath.join(dir, 'config.json')), null)
+})
+
+test('a client that hangs up ends the upstream request (X-16)', async (t) => {
+  const { base, hermes } = await setup(t)
+  const controller = new AbortController()
+  const response = await fetch(base + '/api/stream', { ...bearer('owner-at'), signal: controller.signal })
+  const reader = response.body.getReader()
+  await reader.read()
+  controller.abort()
+  const deadline = Date.now() + 3000
+  while (!hermes.state.streamClosed && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20))
+  assert.equal(hermes.state.streamClosed, true)
+})
+
+test('a socket upgrade asks again about a gate it last saw off (X-16)', async (t) => {
+  const { fetchEdge, base, edge, hermes } = await setup(t)
+  const minted = await (await fetchEdge('/api/auth/ws-ticket', { method: 'POST', ...bearer('owner-at') })).json()
+  hermes.state.gated = false
+  assert.equal(await edge.checkGate(), false) // the 60 s timer catches Hermes restarting
+  hermes.state.gated = true
+  const live = await new Promise((resolve) => {
+    const ws = new WebSocket(`${base.replace('http', 'ws')}/api/ws?ticket=${minted.ticket}`)
+    ws.onmessage = (e) => { resolve(String(e.data)); ws.close() }
+    ws.onerror = () => resolve(null)
+  })
+  assert.equal(live, 'hello from hermes')
+})
+
+test('a flood from one address keeps a bounded list (X-17)', async (t) => {
+  const { fetchEdge, edge } = await setup(t)
+  for (let i = 0; i < 40; i++) await fetchEdge('/api/sessions')
+  assert.ok(edge.limits.failures.size('127.0.0.1') <= edge.edgeConfig.failuresPerIpPerMin + 1)
 })
