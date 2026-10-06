@@ -2,7 +2,8 @@
 // hermes-hq-connect: one command on the computer that runs Hermes, so Hermes HQ can reach it from anywhere with
 // Sign in with Nous, no Tailscale on the phone. It checks each piece and does what's missing:
 //
-//   1. Hermes is installed and a backend (hermes serve / hermes dashboard) answers.
+//   1. This is a Mac, Hermes is installed, and a backend (hermes serve / hermes dashboard) answers. With none running,
+//      it starts `hermes serve` in the background (a LaunchAgent Hermes's own updater knows how to restart).
 //   2. Hermes is signed in to Nous on this computer (if not, it opens the Nous sign-in).
 //   3. Tailscale is on this computer, signed in, with HTTPS names and Funnel allowed (it says what to click if not).
 //   4. The dashboard is registered with Nous for the public address (hermes dashboard register).
@@ -31,6 +32,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const EDGE_LABEL = 'com.hermes-hq.edge'
 // The install from before the app was renamed Hermes HQ: adopted, then retired, by setup.
 const OLD_EDGE_LABEL = 'com.dispatch.edge'
+/** The background Hermes this tool starts when none is running. */
+const HERMES_LABEL = 'com.hermes-hq.hermes'
 const DEFAULT_EDGE_PORT = 9139
 const FUNNEL_PORTS = [443, 8443, 10000]
 
@@ -38,6 +41,8 @@ const FUNNEL_PORTS = [443, 8443, 10000]
 export function systemDeps() {
   return {
     home: os.homedir(),
+    platform: process.platform,
+    path: process.env.PATH ?? '',
     uid: typeof process.getuid === 'function' ? process.getuid() : 501,
     node: process.execPath,
     run: (cmd, args, opts = {}) => {
@@ -51,6 +56,7 @@ export function systemDeps() {
     write: (p, text, mode) => { fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 }); fs.writeFileSync(p, text, { mode: mode ?? 0o600 }) },
     remove: (p) => fs.rmSync(p, { force: true }),
     copy: (from, to) => { fs.mkdirSync(path.dirname(to), { recursive: true, mode: 0o700 }); fs.copyFileSync(from, to) },
+    remove: (p) => fs.rmSync(p, { force: true }),
     fetchJson: async (url, timeoutMs = 4000) => {
       try {
         const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { accept: 'application/json' } })
@@ -217,6 +223,32 @@ function edgePlist(deps) {
 `
 }
 
+/** `hermes serve` (headless, 127.0.0.1:9119) under launchd. ProgramArguments are Hermes's own, unwrapped: `hermes
+ *  update` finds launchd backends by them and kickstarts them instead of starting a second copy. PATH is the one this
+ *  was run with, so the agent's tools find what they find in Terminal. */
+export function hermesPlist(deps, hermes) {
+  const xml = (text) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  const log = path.join(edgePaths(deps).dir, 'hermes.log')
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${HERMES_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>${xml(hermes)}</string><string>serve</string><string>--port</string><string>9119</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>${xml(deps.path || '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin')}</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardErrorPath</key><string>${xml(log)}</string>
+  <key>StandardOutPath</key><string>${xml(log)}</string>
+</dict>
+</plist>
+`
+}
+const hermesPlistPath = (deps) => path.join(deps.home, 'Library/LaunchAgents', HERMES_LABEL + '.plist')
+
 // ---- the steps -------------------------------------------------------------------------------------------------
 
 class Stop extends Error { constructor(message, code = 2) { super(message); this.code = code } }
@@ -225,19 +257,41 @@ export async function setup(deps, { dryRun = false } = {}) {
   const say = (line) => deps.log(line)
   const done = (line) => say('  ✓ ' + line)
   const todo = (line) => say((dryRun ? '  • would ' : '  → ') + line)
-  say('Hermes HQ: reach this computer from anywhere\n')
+  // Other computers connect with Tailscale on the phone instead (Hermes HQ's "Windows, Linux or a server" steps).
+  if ((deps.platform ?? 'darwin') !== 'darwin') throw new Stop('This setup is for a Mac. For Hermes on Linux, Windows or a server, use Tailscale on your phone instead: in Hermes HQ, tap Get Started and choose "On Windows, Linux or a server".')
+  say('Setting up this Mac for Hermes HQ. It takes a few minutes; you\'ll be told when to do something.\n')
 
-  // 1. Hermes and its backend.
+  // 1. Hermes and its backend: started in the background if none is running.
   const hermes = findHermes(deps)
-  if (!hermes) throw new Stop('Hermes isn\'t installed on this computer. Install it first: https://hermes-agent.nousresearch.com/docs/')
+  if (!hermes) throw new Stop('Hermes isn\'t installed on this Mac. Install it first (https://hermes-agent.nousresearch.com/docs/), then run this again.')
   done('Hermes is installed')
-  let backend = null
-  for (const address of hermesBackends(deps)) {
-    const r = await deps.fetchJson(`http://${address}/api/status`)
-    if (r.status === 200 && r.body && 'auth_required' in r.body) { backend = address; break }
+  const findBackend = async () => {
+    for (const address of hermesBackends(deps)) {
+      const r = await deps.fetchJson(`http://${address}/api/status`)
+      if (r.status === 200 && r.body && 'auth_required' in r.body) return address
+    }
+    return null
   }
-  if (!backend) throw new Stop('Hermes isn\'t running its dashboard. Start it with "hermes dashboard --no-open" (or "hermes serve"), leave it running, then run this again.')
-  done(`Hermes is running (${backend})`)
+  let backend = await findBackend()
+  const running = Boolean(backend)
+  // A dry run carries on as if Hermes were started at its default address.
+  if (!backend && dryRun) { todo('start Hermes in the background (hermes serve), and again whenever you log in'); backend = '127.0.0.1:9119' }
+  else if (!backend) {
+    todo('Starting Hermes in the background, so your phone can reach it any time (it starts again when you log in)')
+    const plist = hermesPlistPath(deps)
+    deps.write(plist, hermesPlist(deps, hermes), 0o644)
+    if (deps.run('/bin/launchctl', ['print', `gui/${deps.uid}/${HERMES_LABEL}`]).status === 0) deps.run('/bin/launchctl', ['bootout', `gui/${deps.uid}/${HERMES_LABEL}`])
+    const r = deps.run('/bin/launchctl', ['bootstrap', `gui/${deps.uid}`, plist])
+    if (r.status !== 0) throw new Stop('Hermes didn\'t start in the background: ' + (r.stderr.trim() || 'launchctl refused it') + '. Start it yourself with "hermes serve" in another Terminal window, leave it open, then run this again.')
+    // A first start can take a while (Hermes loads its tools); the log says why if it never answers.
+    for (let i = 0; i < 60 && !backend; i++) { await deps.sleep(2000); backend = await findBackend() }
+    if (!backend) {
+      // Nothing left behind restarting every few seconds (a port taken by something else, say).
+      deps.run('/bin/launchctl', ['bootout', `gui/${deps.uid}/${HERMES_LABEL}`]); deps.remove(plist)
+      throw new Stop(`Hermes didn't start in the background. Its log: ${path.join(edgePaths(deps).dir, 'hermes.log')}. Start it yourself with "hermes serve" in another Terminal window, leave it open, then run this again.`)
+    }
+  }
+  if (running || !dryRun) done(`Hermes is running (${backend})`)
 
   // 2. Nous sign-in on this computer: its account becomes the gateway's owner.
   let owner = nousAccount(deps)
@@ -363,9 +417,12 @@ export async function setup(deps, { dryRun = false } = {}) {
   if (dryRun) { say('\nNothing was changed (dry run).'); return { url, dryRun: true } }
 
   // 8. The phone.
-  say('\nNow, on your iPhone: open the Camera, point it at this code, and tap "Open in Hermes HQ".\n')
+  say('\nDone! Now connect your iPhone:')
+  say('  1. Open the Camera on your iPhone and point it at this code.')
+  say('  2. Tap "Open in Hermes HQ", then tap Sign in with Nous.\n')
   say(qrTerminal(connectLink(url)))
-  say(`\nThen tap Sign in with Nous. (Or in Hermes HQ, add the gateway ${url})`)
+  say(`\nCan't scan it? In Hermes HQ, tap "I already have an address" and type: ${url}`)
+  say('Keep this Mac on and awake: your iPhone can reach Hermes only while it is.')
   say('To turn it off later: curl -fsSL https://raw.githubusercontent.com/mrcharlesiv/hermes-hq/main/connect.sh | sh -s -- off')
   return { url, owner: Boolean(owner) }
 }
@@ -380,7 +437,9 @@ export async function status(deps) {
   const funnel = ts && port && (ts.serve?.AllowFunnel ?? {})[`${ts.dnsName}:${port}`] === true
   say(`Gatekeeper: ${loaded ? 'running' : 'off'}${cfg ? ` (${cfg.owners?.length ?? 0} allowed Nous account${cfg.owners?.length === 1 ? '' : 's'})` : ''}`)
   say(`Public address: ${funnel ? publicUrl(ts.dnsName, port) : 'off'}`)
-  return { gatekeeper: loaded, url: funnel ? publicUrl(ts.dnsName, port) : null }
+  const background = deps.run('/bin/launchctl', ['print', `gui/${deps.uid}/${HERMES_LABEL}`]).status === 0
+  if (background) say('Hermes: running in the background (started by this setup)')
+  return { gatekeeper: loaded, url: funnel ? publicUrl(ts.dnsName, port) : null, background }
 }
 
 export async function off(deps) {
@@ -394,6 +453,12 @@ export async function off(deps) {
   }
   for (const label of [EDGE_LABEL, OLD_EDGE_LABEL]) {
     if (loadedJob(deps, label)) { deps.run('/bin/launchctl', ['bootout', `gui/${deps.uid}/${label}`]); say('  ✓ Gatekeeper stopped') }
+  }
+  // The background Hermes, if this setup started it: everything it added comes off.
+  if (deps.exists(hermesPlistPath(deps))) {
+    deps.run('/bin/launchctl', ['bootout', `gui/${deps.uid}/${HERMES_LABEL}`])
+    deps.remove(hermesPlistPath(deps))
+    say('  ✓ Hermes no longer runs in the background (this setup had started it). Start it yourself any time with: hermes dashboard')
   }
   say('Your computer is reachable again only the way it was before (Tailscale or your network). Nous registration stays; remove it at https://portal.nousresearch.com/local-dashboards if you like.')
 }

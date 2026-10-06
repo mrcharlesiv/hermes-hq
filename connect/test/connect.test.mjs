@@ -11,21 +11,21 @@ const jwt = (claims) => ['e30', Buffer.from(JSON.stringify(claims)).toString('ba
 const EDGE_SOURCE = fs.readFileSync(fileURLToPath(new URL('../hermes-hq-edge.mjs', import.meta.url)), 'utf8')
 
 /** A computer: files, processes, Tailscale and Hermes as the tool would find them, and a record of what it did. */
-function machine({ hermes = true, running = true, nous = true, tailscale = 'running', https = true, funnelAllowed = true, serve = {}, env = '', launchAgent = true, old = null, newEdgeStarts = true } = {}) {
-  const files = new Map(), ran = [], logs = []
+function machine({ hermes = true, running = true, nous = true, tailscale = 'running', https = true, funnelAllowed = true, serve = {}, env = '', launchAgent = true, platform = 'darwin', hermesStarts = true, old = null, newEdgeStarts = true } = {}) {
+  const files = new Map(), ran = [], logs = [], loaded = new Set(old ? ['com.dispatch.edge'] : [])
   let backendNous = env.includes('OAUTH_CLIENT_ID'), funnel = { ...serve }
-  const jobs = new Set(old ? ['com.dispatch.edge'] : []) // launchd jobs loaded, by label
+  const label = (target) => target.split('/').pop().replace(/\.plist$/, '')
   if (old) {
     files.set(`${HOME}/.config/dispatch-edge/config.json`, JSON.stringify(old.config))
     files.set(`${HOME}/.config/dispatch-edge/dispatch-edge.mjs`, 'old edge')
     files.set(`${HOME}/Library/LaunchAgents/com.dispatch.edge.plist`, '<string>com.dispatch.edge</string>')
   }
-  const edgeLoaded = () => jobs.size > 0
+  const edgeLoaded = () => loaded.has('com.hermes-hq.edge') || loaded.has('com.dispatch.edge')
   if (nous) files.set(`${HOME}/.hermes/auth.json`, JSON.stringify({ providers: { nous: { access_token: jwt({ sub: 'user_owner', iss: 'https://portal.nousresearch.com' }) } } }))
   files.set(`${HOME}/.hermes/.env`, env)
   if (launchAgent) files.set(`${HOME}/Library/LaunchAgents/ai.hermes.serve.plist`, '<key>Label</key><string>ai.hermes.serve</string><string>/x/bin/hermes</string><string>serve</string><string>9119</string>')
   const deps = {
-    home: HOME, uid: 501, node: '/usr/local/bin/node',
+    home: HOME, uid: 501, node: '/usr/local/bin/node', platform, path: '/opt/homebrew/bin:/usr/bin:/bin',
     which: (name) => (name === 'hermes' && hermes ? '/x/bin/hermes' : name === 'tailscale' && tailscale ? '/x/bin/tailscale' : ''),
     exists: (p) => files.has(p) || p.endsWith('hermes-hq-edge.mjs') && !p.startsWith(HOME),
     read: (p) => { if (p.endsWith('hermes-hq-edge.mjs') && !p.startsWith(HOME)) return EDGE_SOURCE; if (!files.has(p)) throw new Error('ENOENT ' + p); return files.get(p) },
@@ -36,7 +36,7 @@ function machine({ hermes = true, running = true, nous = true, tailscale = 'runn
     log: (line = '') => logs.push(line),
     fetchJson: async (url) => {
       if (url.includes(':9119/api/status')) return running ? { status: 200, body: { auth_required: backendNous, auth_providers: backendNous ? ['nous'] : [], auth_flows: backendNous ? ['cookie', 'native_pkce'] : ['cookie'] } } : { status: 0, body: null }
-      if (url.includes(':9139/api/status')) return edgeLoaded() && (newEdgeStarts || !jobs.has('com.hermes-hq.edge')) ? { status: 200, body: {} } : { status: 0, body: null }
+      if (url.includes(':9139/api/status')) return edgeLoaded() && (newEdgeStarts || !loaded.has('com.hermes-hq.edge')) ? { status: 200, body: {} } : { status: 0, body: null }
       return { status: 0, body: null }
     },
     run: (cmd, args) => {
@@ -47,9 +47,14 @@ function machine({ hermes = true, running = true, nous = true, tailscale = 'runn
       if (cmd.endsWith('hermes') && args[0] === 'auth') { files.set(`${HOME}/.hermes/auth.json`, JSON.stringify({ nous: { access_token: jwt({ sub: 'user_owner', iss: 'https://portal.nousresearch.com' }) } })); return { status: 0 } }
       if (cmd.endsWith('hermes') && args[0] === 'dashboard') { files.set(`${HOME}/.hermes/.env`, `HERMES_DASHBOARD_OAUTH_CLIENT_ID=agent:abc\nHERMES_DASHBOARD_PUBLIC_URL=${args[5].replace('/auth/callback', '')}\n`); return { status: 0 } }
       if (cmd === '/bin/launchctl' && args[0] === 'kickstart') { backendNous = files.get(`${HOME}/.hermes/.env`).includes('OAUTH_CLIENT_ID'); return { status: 0 } }
-      if (cmd === '/bin/launchctl' && args[0] === 'print') return { status: jobs.has(args[1].split('/').pop()) ? 0 : 113 }
-      if (cmd === '/bin/launchctl' && args[0] === 'bootstrap') { jobs.add(args[2].split('/').pop().replace(/\.plist$/, '')); return { status: 0 } }
-      if (cmd === '/bin/launchctl' && args[0] === 'bootout') { jobs.delete(args[1].split('/').pop()); return { status: 0 } }
+      if (cmd === '/bin/launchctl' && args[0] === 'print') return { status: loaded.has(label(args[1])) ? 0 : 113 }
+      if (cmd === '/bin/launchctl' && args[0] === 'bootstrap') {
+        loaded.add(label(args[2]))
+        // The background Hermes answers once launchd starts it (hermesStarts: false, a Hermes that never comes up).
+        if (label(args[2]) === 'com.hermes-hq.hermes') running = hermesStarts
+        return { status: 0 }
+      }
+      if (cmd === '/bin/launchctl' && args[0] === 'bootout') { loaded.delete(label(args[1])); if (label(args[1]) === 'com.hermes-hq.hermes') running = false; return { status: 0 } }
       if (cmd.endsWith('tailscale') && args[0] === 'status') return { status: 0, stdout: JSON.stringify({ BackendState: tailscale === 'running' ? 'Running' : 'NeedsLogin', CertDomains: https ? ['new-mac.tail1.ts.net'] : [], Self: { DNSName: 'new-mac.tail1.ts.net.', Capabilities: funnelAllowed ? ['https://tailscale.com/cap/funnel-ports?ports=443,8443,10000'] : [] } }) }
       if (cmd.endsWith('tailscale') && args[0] === 'serve') return { status: 0, stdout: JSON.stringify(funnel) }
       if (cmd.endsWith('tailscale') && args[0] === 'funnel' && args[1] === '--bg') {
@@ -61,7 +66,7 @@ function machine({ hermes = true, running = true, nous = true, tailscale = 'runn
       return { status: 0, stdout: '' }
     },
   }
-  return { deps, files, ran, logs, state: () => ({ backendNous, edgeLoaded: edgeLoaded(), jobs: [...jobs], funnel }) }
+  return { deps, files, ran, logs, state: () => ({ backendNous, edgeLoaded: edgeLoaded(), jobs: [...loaded].filter((l) => l.endsWith('.edge')), hermesLoaded: loaded.has('com.hermes-hq.hermes'), running, funnel }) }
 }
 
 test('a fresh computer: registers, restarts Hermes, installs the gatekeeper with its own Nous account, opens Funnel, shows the QR', async () => {
@@ -109,7 +114,7 @@ test('not signed in to Nous: opens the Nous sign-in, then carries on', async () 
 test('each thing only a person can do stops with what to do, before anything changes', async () => {
   for (const [opts, message] of [
     [{ hermes: false }, /Hermes isn't installed/],
-    [{ running: false }, /isn't running its dashboard/],
+    [{ platform: 'linux' }, /This setup is for a Mac/],
     [{ tailscale: '' }, /Install Tailscale on this computer \(not on your phone\)/],
     [{ tailscale: 'stopped' }, /not signed in/],
     [{ https: false }, /MagicDNS and HTTPS Certificates/],
@@ -147,6 +152,55 @@ test('off: closes the public address and stops the gatekeeper', async () => {
   await off(m.deps)
   assert.ok(m.ran.includes('/x/bin/tailscale funnel --https=443 off'))
   assert.equal(m.state().edgeLoaded, false)
+})
+
+test('Hermes not running: starts `hermes serve` in the background, as a job Hermes\'s own updater restarts, then carries on', async () => {
+  const m = machine({ running: false, launchAgent: false })
+  const result = await setup(m.deps)
+  assert.equal(result.url, 'https://new-mac.tail1.ts.net')
+  const plist = m.files.get(`${HOME}/Library/LaunchAgents/com.hermes-hq.hermes.plist`)
+  // Hermes's argv as launchd runs it, unwrapped: `hermes update` reads ProgramArguments to find launchd backends.
+  assert.match(plist, /<array><string>\/x\/bin\/hermes<\/string><string>serve<\/string><string>--port<\/string><string>9119<\/string><\/array>/)
+  assert.match(plist, /<key>PATH<\/key><string>\/opt\/homebrew\/bin:\/usr\/bin:\/bin<\/string>/)
+  assert.ok(m.ran.includes(`/bin/launchctl bootstrap gui/501 ${HOME}/Library/LaunchAgents/com.hermes-hq.hermes.plist`))
+  // The restart that turns Nous sign-in on goes through that same job.
+  assert.ok(m.ran.includes('/bin/launchctl kickstart -k gui/501/com.hermes-hq.hermes'))
+  assert.match(m.logs.join('\n'), /Starting Hermes in the background/)
+})
+
+test('a background Hermes that never answers stops with where to look and what to do instead', async () => {
+  const m = machine({ running: false, launchAgent: false, hermesStarts: false })
+  await assert.rejects(setup(m.deps), /Hermes didn't start in the background\. Its log: .*hermes\.log\. Start it yourself with "hermes serve"/)
+  assert.ok(!m.ran.some((c) => /register|funnel --bg/.test(c)))
+  // Nothing is left loaded to restart forever.
+  assert.equal(m.state().hermesLoaded, false)
+  assert.equal(m.files.has(`${HOME}/Library/LaunchAgents/com.hermes-hq.hermes.plist`), false)
+})
+
+test('--dry-run with Hermes stopped says it would start it, and starts nothing', async () => {
+  const m = machine({ running: false, launchAgent: false })
+  await setup(m.deps, { dryRun: true })
+  assert.match(m.logs.join('\n'), /would start Hermes in the background/)
+  assert.ok(!m.ran.some((c) => /bootstrap|register|kickstart|funnel --bg/.test(c)))
+  assert.equal(m.files.has(`${HOME}/Library/LaunchAgents/com.hermes-hq.hermes.plist`), false)
+})
+
+test('off also stops the background Hermes this setup started, and removes it', async () => {
+  const m = machine({ running: false, launchAgent: false })
+  await setup(m.deps)
+  await off(m.deps)
+  assert.equal(m.state().hermesLoaded, false)
+  assert.equal(m.files.has(`${HOME}/Library/LaunchAgents/com.hermes-hq.hermes.plist`), false)
+  assert.match(m.logs.join('\n'), /Hermes no longer runs in the background/)
+})
+
+test('the last screen says how to connect the phone, and how to type the address instead', async () => {
+  const m = machine()
+  await setup(m.deps)
+  const out = m.logs.join('\n')
+  assert.match(out, /Open the Camera on your iPhone and point it at this code/)
+  assert.match(out, /Can't scan it\? In Hermes HQ, tap "I already have an address" and type: https:\/\/new-mac\.tail1\.ts\.net/)
+  assert.match(out, /Keep this Mac on and awake/)
 })
 
 // The owner's Mac (and anyone who ran setup before the rename): com.dispatch.edge in ~/.config/dispatch-edge, with
