@@ -622,7 +622,7 @@ test('agent on Linux with no Tailscale and no admin rights: installs this accoun
   const m = asAgent(linux({ running: false, linger: true, tailscale: 'none' }))
   const step = await nextStep(setup(m.deps))
   assert.equal(step.forWhom, 'person')
-  assert.equal(step.message, 'Sign in to Tailscale for the computer running Hermes (free; your phone doesn\'t need it): open https://login.tailscale.com/a/own123')
+  assert.equal(step.message, 'Sign in to Tailscale for the computer running Hermes: open https://login.tailscale.com/a/own123. Tailscale (free) gives that computer an address your phone can reach from anywhere, and Sign in with Nous makes sure only you get in. Your phone doesn\'t need Tailscale.')
   // Tailscale's static build, checked against its published checksum, unpacked beside the gatekeeper.
   assert.ok(m.ran.includes(`curl -fsSL --retry 3 -o ${OWN_TS}/tailscale_1.102.5_amd64.tgz https://pkgs.tailscale.com/stable/tailscale_1.102.5_amd64.tgz`))
   assert.ok(m.ran.includes(`tar -xzf ${OWN_TS}/tailscale_1.102.5_amd64.tgz -C ${OWN_TS}/bin --strip-components=1`))

@@ -448,6 +448,9 @@ class Stop extends Error { constructor(message, code = 2) { super(message); this
 export class NextStep extends Stop { constructor(forWhom, message) { super(message, 3); this.forWhom = forWhom } }
 /** Another program's words, safe to pass on in a chat: Hermes sends any file named by its full path along with the
  *  message (it once sent a Nous sign-in file that way), so paths become "…". Links are left as they are. */
+/** Why Tailscale, in the same plain words wherever a step asks for it: Sign in with Nous is who gets in, Tailscale is
+ *  how the phone finds the computer, and it runs only on the computer. */
+const tailscaleWhy = (it) => `Tailscale (free) gives ${it} an address your phone can reach from anywhere, and Sign in with Nous makes sure only you get in. Your phone doesn't need Tailscale.`
 export const relayable = (text) => String(text ?? '').replace(/(^|[\s"'(=])(?:~\/|\/)[^\s"')]+/g, '$1…').replace(/\s+/g, ' ').trim()
 export const nextStepText = (step) => step.forWhom === 'person'
   ? `NEXT STEP for the person (send them this, word for word, then wait until they say it's done):\n  ${step.message}\nThen run this same command again.`
@@ -482,7 +485,8 @@ export async function setup(deps, { dryRun = false } = {}) {
     throw new Stop('This setup keeps Hermes and its gatekeeper running with systemd user services, which this session can\'t reach. Log in to this computer directly or over SSH (not with su or sudo), then run this again.')
   }
   const agent = Boolean(deps.agent) && !dryRun
-  say(`Setting up ${computer} for Hermes HQ. It takes a few minutes; ${agent ? 'a step that needs the person says NEXT STEP' : 'you\'ll be told when to do something'}.\n`)
+  say(`Setting up ${computer} for Hermes HQ. It takes a few minutes; ${agent ? 'a step that needs the person says NEXT STEP' : 'you\'ll be told when to do something'}.`)
+  say(`It may need two free sign-ins: Nous, so only you get in, and Tailscale, which gives ${computer} an address your phone can reach from anywhere (only ${computer} needs Tailscale, not your phone).\n`)
 
   // 1. Hermes and its backend: started in the background if none is running.
   const hermes = findHermes(deps)
@@ -589,8 +593,8 @@ export async function setup(deps, { dryRun = false } = {}) {
     } else cli = await ownTailscale(deps, jobs, say, todo)
   }
   const own = cli === ownCli
-  if (!cli && agent && mac) throw new NextStep('person', 'Install Tailscale on the Mac running Hermes (not on your phone): https://tailscale.com/download/mac or the Mac App Store. Open it and sign in.')
-  if (!cli) throw new Stop(mac ? 'Install Tailscale on this Mac (not on your phone): https://tailscale.com/download/mac. Open it, sign in, then run this again.'
+  if (!cli && agent && mac) throw new NextStep('person', `Install Tailscale on the Mac running Hermes (not on your phone): https://tailscale.com/download/mac or the Mac App Store. Open it and sign in. ${tailscaleWhy('that Mac')}`)
+  if (!cli) throw new Stop(mac ? `Install Tailscale on this Mac (not on your phone): https://tailscale.com/download/mac. Open it, sign in, then run this again. ${tailscaleWhy('this Mac')}`
     : 'Install Tailscale on this computer (not on your phone): curl -fsSL https://tailscale.com/install.sh | sh, then sudo tailscale up and sign in. Then run this again.')
   let ts = tailscaleState(deps, cli)
   if (!ts.running && own) {
@@ -598,29 +602,29 @@ export async function setup(deps, { dryRun = false } = {}) {
     if (agent) {
       const link = tailscaleSignInLink(deps, cli)
       ts = tailscaleState(deps, cli)
-      if (!ts.running && link) throw new NextStep('person', `Sign in to Tailscale for the computer running Hermes (free; your phone doesn't need it): open ${link}`)
+      if (!ts.running && link) throw new NextStep('person', `Sign in to Tailscale for the computer running Hermes: open ${link}. ${tailscaleWhy('that computer')}`)
       if (!ts.running) throw new NextStep('agent', 'Tailscale on this computer is still starting. Wait a minute, then run this same command again.')
     } else {
-      say('  → Sign in to Tailscale (free; your phone doesn\'t need it): open the link below in any browser, then come back here.')
+      say(`  → Sign in to Tailscale: open the link below in any browser, then come back here. ${tailscaleWhy('this computer')}`)
       deps.run(cli, ['up'], { interactive: true, timeoutMs: 15 * 60_000 })
       ts = tailscaleState(deps, cli)
       if (!ts.running) throw new Stop('Tailscale isn\'t signed in yet. Run this again and open the link it shows.')
     }
   }
   if (!ts.running && agent) {
-    if (mac) throw new NextStep('person', 'Open the Tailscale app on the Mac running Hermes and sign in (it\'s free). Your phone doesn\'t need Tailscale.')
+    if (mac) throw new NextStep('person', `Open the Tailscale app on the Mac running Hermes and sign in. ${tailscaleWhy('that Mac')}`)
     const root = sudoPrefix(deps)
-    if (!root) throw new NextStep('person', `On the computer running Hermes, run this once in a terminal (it asks for your password), then open the sign-in link it shows: sudo tailscale up --operator=${deps.user}`)
+    if (!root) throw new NextStep('person', `On the computer running Hermes, run this once in a terminal (it asks for your password), then open the sign-in link it shows: sudo tailscale up --operator=${deps.user}. ${tailscaleWhy('that computer')}`)
     // `tailscale up` leaves the sign-in link with Tailscale itself: waiting for it is the person's job, not this run's.
     const r = asRoot(deps, root, cli, ['up', `--operator=${deps.user}`, '--timeout=15s'], { timeoutMs: 30_000 })
     let auth = /https:\/\/login\.tailscale\.com\/\S+/.exec(r.stdout + r.stderr)?.[0]
     try { auth ??= JSON.parse(deps.run(cli, ['status', '--json']).stdout).AuthURL || undefined } catch {}
     ts = tailscaleState(deps, cli)
-    if (!ts.running) throw new NextStep('person', auth ? `Sign in to Tailscale for the computer running Hermes (free; your phone doesn't need it): open ${auth}` : `On the computer running Hermes, run this once in a terminal and open the sign-in link it shows: sudo tailscale up --operator=${deps.user}`)
+    if (!ts.running) throw new NextStep('person', (auth ? `Sign in to Tailscale for the computer running Hermes: open ${auth}.` : `On the computer running Hermes, run this once in a terminal and open the sign-in link it shows: sudo tailscale up --operator=${deps.user}.`) + ' ' + tailscaleWhy('that computer'))
   }
   if (!ts.running) throw new Stop(mac ? 'Tailscale is installed but not signed in. Open Tailscale, sign in, then run this again.'
     : 'Tailscale is installed but not signed in. Run sudo tailscale up, sign in, then run this again.')
-  if ((!ts.dnsName || !ts.httpsNames) && agent) throw new NextStep('person', 'Turn on MagicDNS and HTTPS Certificates for your Tailscale network: open https://login.tailscale.com/admin/dns and switch both on.')
+  if ((!ts.dnsName || !ts.httpsNames) && agent) throw new NextStep('person', 'Turn on MagicDNS and HTTPS Certificates for your Tailscale network: open https://login.tailscale.com/admin/dns and switch both on. They give the computer its web address.')
   if (!ts.dnsName || !ts.httpsNames) throw new Stop('Turn on MagicDNS and HTTPS Certificates for your tailnet: https://login.tailscale.com/admin/dns (both are one switch each). Then run this again.')
   tailscaleOperator(deps, cli, say, dryRun)
   if (!ts.serveRead) ts = tailscaleState(deps, cli)
@@ -733,7 +737,7 @@ export async function setup(deps, { dryRun = false } = {}) {
     const r = deps.run(cli, ['funnel', '--bg', `--https=${port}`, `http://127.0.0.1:${edgePort}`], agent ? { timeoutMs: 30_000 } : { interactive: true, timeoutMs: 15 * 60_000 })
     if (r.status !== 0 && agent) {
       const allow = /https:\/\/login\.tailscale\.com\/\S+/.exec(r.stdout + r.stderr)?.[0]
-      if (allow) throw new NextStep('person', `Allow Tailscale Funnel (your computer's public address) on your Tailscale network: open ${allow} and turn it on.`)
+      if (allow) throw new NextStep('person', `Allow Tailscale Funnel on your Tailscale network: open ${allow} and turn it on. It puts the computer's address on the internet, where only its gatekeeper answers, and the gatekeeper lets in only your Nous account.`)
       throw new Stop('Tailscale didn\'t turn on the public address: ' + relayable((r.stdout + r.stderr).trim().split('\n').slice(-3).join(' / ')))
     }
     if (r.status !== 0) throw new Stop('Tailscale didn\'t turn on the public address (see above). Fix that, then run this again.')
