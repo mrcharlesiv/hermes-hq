@@ -49,6 +49,13 @@ const LOG_MAX_BYTES = 5 * 1024 * 1024
 // only client here is the native app with its bearer in a header, which no page can drive.
 const COMPRESSIBLE = /^\s*(application\/(json|[a-z0-9.+-]*\+json|javascript|xml)|text\/(?!event-stream)[a-z0-9.+-]+|image\/svg\+xml)\s*(;|$)/i
 const COMPRESS_MIN_BYTES = 1024
+// Hermes's web server (uvicorn) closes a connection after 5 s idle, and Node keeps an idle one for 5 s too: a request
+// sent on a connection Hermes is closing was reset before any answer (ECONNRESET on a reused socket) and reached the
+// phone as a 502, often on the socket ticket. The edge keeps idle connections UPSTREAM_IDLE_MS, well inside Hermes's
+// window, and sends a bodyless read again once when it still meets that reset (Node's documented reusedSocket case).
+const UPSTREAM_IDLE_MS = 2000
+const RETRY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+const staleConnection = (error, request) => request.reusedSocket === true && (error?.code === 'ECONNRESET' || error?.code === 'EPIPE')
 
 export function loadConfig(file) {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
@@ -94,6 +101,7 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
   const cfg = config.upstream instanceof URL ? config : normalizeConfig(config)
   const upstreamHost = cfg.upstream.host // Hermes refuses any Host but its bound or declared public one.
   const client = http
+  const agent = new http.Agent({ keepAlive: true, timeout: UPSTREAM_IDLE_MS })
   const verified = new Map() // sha256(bearer) -> {userId, until}
   const authorizeLimit = limiter(10 * 60_000, cfg.authorizePerIpPer10Min, now)
   // Defence in depth: Hermes's own gate must stay on (a non-loopback bind). A Hermes bound to 127.0.0.1 checks
@@ -173,47 +181,54 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
    *  upstream request ends with the client's: a phone that went away doesn't leave Hermes streaming to nobody. */
   function proxy(req, res, { path = req.url, bearer = null, cookies = null, keepCookie, decision, compress = false }) {
     let answered = false
-    const upstreamReq = client.request({ protocol: cfg.upstream.protocol, hostname: cfg.upstream.hostname, port: cfg.upstream.port,
-      method: req.method, path, headers: forwardHeaders(req, { bearer, cookies }) }, (upstreamRes) => {
-      answered = true
-      clearTimeout(waiting)
-      const headers = responseHeaders(upstreamRes, { keepCookie })
-      upstreamRes.on('error', () => res.destroy())
-      if (compress && shouldCompress(req, upstreamRes)) {
-        for (const name of Object.keys(headers)) if (name.toLowerCase() === 'content-length') delete headers[name]
-        headers['content-encoding'] = 'gzip'
-        headers.vary = [].concat(headers.vary ?? []).concat('Accept-Encoding').join(', ')
-        res.writeHead(upstreamRes.statusCode ?? 502, headers)
-        const gzip = zlib.createGzip({ level: 5 })
-        gzip.on('error', () => res.destroy())
-        upstreamRes.pipe(gzip).pipe(res)
-      } else {
-        res.writeHead(upstreamRes.statusCode ?? 502, headers)
-        upstreamRes.pipe(res)
-      }
-      record(req, upstreamRes.statusCode, decision)
-    })
+    let upstreamReq
+    const ask = (retried) => {
+      const sent = upstreamReq = client.request({ protocol: cfg.upstream.protocol, hostname: cfg.upstream.hostname, port: cfg.upstream.port, agent,
+        method: req.method, path, headers: forwardHeaders(req, { bearer, cookies }) }, (upstreamRes) => {
+        answered = true
+        clearTimeout(waiting)
+        const headers = responseHeaders(upstreamRes, { keepCookie })
+        upstreamRes.on('error', () => res.destroy())
+        if (compress && shouldCompress(req, upstreamRes)) {
+          for (const name of Object.keys(headers)) if (name.toLowerCase() === 'content-length') delete headers[name]
+          headers['content-encoding'] = 'gzip'
+          headers.vary = [].concat(headers.vary ?? []).concat('Accept-Encoding').join(', ')
+          res.writeHead(upstreamRes.statusCode ?? 502, headers)
+          const gzip = zlib.createGzip({ level: 5 })
+          gzip.on('error', () => res.destroy())
+          upstreamRes.pipe(gzip).pipe(res)
+        } else {
+          res.writeHead(upstreamRes.statusCode ?? 502, headers)
+          upstreamRes.pipe(res)
+        }
+        record(req, upstreamRes.statusCode, decision)
+      })
+      sent.on('error', (error) => {
+        if (res.writableEnded || sent !== upstreamReq) return
+        if (answered) { clearTimeout(waiting); return res.destroy() }
+        if (!retried && RETRY_METHODS.has(req.method) && staleConnection(error, sent)) return ask(true)
+        clearTimeout(waiting)
+        // The system error code only (ECONNREFUSED, ECONNRESET…): never a message, which could quote an address.
+        const code = typeof error?.code === 'string' && /^[A-Z_]{3,32}$/.test(error.code) ? error.code : 'unknown'
+        send(res, 502, { error: 'upstream_unreachable' }); record(req, 502, 'upstream-error', { code, reused: sent.reusedSocket === true, retried })
+      })
+      // A read has no body to send (and so can be sent again); anything else streams the client's body through.
+      if (RETRY_METHODS.has(req.method)) sent.end(); else req.pipe(sent)
+    }
     const waiting = setTimeout(() => {
       upstreamReq.destroy()
       send(res, 504, { error: 'upstream_timeout' }); record(req, 504, 'upstream-timeout')
     }, UPSTREAM_ANSWER_MS)
     waiting.unref?.()
-    upstreamReq.on('error', (error) => {
-      clearTimeout(waiting)
-      if (res.writableEnded) return
-      if (answered) return res.destroy()
-      // The system error code only (ECONNREFUSED, ECONNRESET…): never a message, which could quote an address.
-      const code = typeof error?.code === 'string' && /^[A-Z_]{3,32}$/.test(error.code) ? error.code : 'unknown'
-      send(res, 502, { error: 'upstream_unreachable' }); record(req, 502, 'upstream-error', { code, reused: upstreamReq.reusedSocket === true })
-    })
     res.on('close', () => { clearTimeout(waiting); if (!res.writableFinished) upstreamReq.destroy() })
-    req.pipe(upstreamReq)
+    ask(false)
   }
 
+
   /** One buffered call to Hermes (auth checks and the token routes). */
-  function call(method, path, { headers = {}, body = null } = {}) {
+  function call(method, path, { headers = {}, body = null } = {}, retried = false) {
     return new Promise((resolve) => {
-      const upstreamReq = client.request({ protocol: cfg.upstream.protocol, hostname: cfg.upstream.hostname, port: cfg.upstream.port,
+      const upstreamReq = client.request({ protocol: cfg.upstream.protocol, hostname: cfg.upstream.hostname, port: cfg.upstream.port, agent,
         method, path, headers: { host: upstreamHost, accept: 'application/json', ...headers, ...(body ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {}) } }, (upstreamRes) => {
         const chunks = []
         upstreamRes.on('data', (c) => chunks.push(c))
@@ -221,7 +236,11 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
         upstreamRes.on('error', () => resolve({ status: 502, headers: {}, body: Buffer.alloc(0) }))
       })
       upstreamReq.setTimeout(15_000, () => upstreamReq.destroy())
-      upstreamReq.on('error', () => resolve({ status: 502, headers: {}, body: Buffer.alloc(0) }))
+      upstreamReq.on('error', (error) => {
+        // Nothing was answered on a connection Hermes had just closed: the same call once more on a fresh one.
+        if (!retried && staleConnection(error, upstreamReq)) return resolve(call(method, path, { headers, body }, true))
+        resolve({ status: 502, headers: {}, body: Buffer.alloc(0) })
+      })
       if (body) upstreamReq.write(body)
       upstreamReq.end()
     })

@@ -372,3 +372,44 @@ test('Accept-Encoding is read with its weights (build 205)', () => {
   assert.equal(acceptsGzip('identity'), false)
   assert.equal(acceptsGzip(undefined), false)
 })
+
+/** A Hermes that resets a reused connection the first time a given path arrives on one: the keep-alive close race. */
+async function resettingHermes(t, paths) {
+  const seen = []
+  const spent = new Set()
+  const server = http.createServer((req, res) => {
+    const path = new URL(req.url, 'http://x').pathname
+    req.socket.served = (req.socket.served ?? 0) + 1
+    seen.push({ path, reused: req.socket.served > 1 })
+    if (paths.includes(path) && req.socket.served > 1 && !spent.has(path)) { spent.add(path); return req.socket.destroy() }
+    const body = path === '/api/status' ? { auth_required: true, auth_providers: ['nous'], auth_flows: ['native_pkce'] } : { ok: true }
+    const text = JSON.stringify(body)
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) }); res.end(text)
+  })
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  const logs = []
+  const edge = createEdge({ upstream: `http://127.0.0.1:${server.address().port}`, owners: [OWNER] }, { log: (e) => logs.push(e) })
+  await new Promise((r) => edge.listen(0, '127.0.0.1', r))
+  t.after(() => { edge.close(); server.close(); server.closeAllConnections?.() })
+  return { seen, logs, base: `http://127.0.0.1:${edge.address().port}` }
+}
+
+test('a read that meets a connection Hermes just closed is sent once more on a fresh one (build 205)', async (t) => {
+  const { seen, logs, base } = await resettingHermes(t, ['/api/health'])
+  // Warm the edge's pool so the next read goes out on a reused connection.
+  assert.equal((await raw(base, '/api/health')).status, 200)
+  const second = await raw(base, '/api/health')
+  assert.equal(second.status, 200, 'the phone never sees the reset')
+  const health = seen.filter((r) => r.path === '/api/health')
+  assert.equal(health.length, 3, 'one answered, one reset, one sent again')
+  assert.ok(!logs.some((e) => e.decision === 'upstream-error'))
+})
+
+test("the edge's own calls (the public status) are sent once more after the same reset (build 205)", async (t) => {
+  const { seen, base } = await resettingHermes(t, ['/api/status'])
+  assert.equal((await raw(base, '/api/health')).status, 200)
+  const status = await raw(base, '/api/status')
+  assert.equal(status.status, 200)
+  assert.deepEqual(JSON.parse(status.body.toString('utf8')).auth_providers, ['nous'])
+  assert.ok(seen.filter((r) => r.path === '/api/status').length >= 2)
+})
