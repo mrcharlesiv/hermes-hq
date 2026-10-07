@@ -694,3 +694,19 @@ test('own Tailscale that never answers stops with where its messages are, rather
   // Its output goes to the journal, which rotates it: no log file of its own that grows forever.
   assert.doesNotMatch(m.files.get(`${UNITS}/hermes-hq-tailscale.service`), /^Standard(Output|Error)=/m)
 })
+
+test('a background Hermes this setup started before it asked for Hermes\'s folder is started again with that folder, once', async () => {
+  const before = `[Unit]\nDescription=Hermes for Hermes HQ (hermes serve)\n\n[Service]\nExecStart="${LHOME}/.local/bin/hermes" "serve" "--port" "9119"\nEnvironment="PATH=/usr/local/bin:/usr/bin:/bin"\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n`
+  const m = asAgent(linux({ linger: true, operator: true, hermesDir: '/opt/native-rev/data', units: { [`${UNITS}/hermes-hq-hermes.service`]: before } }))
+  m.state().active.add('hermes-hq-hermes.service')
+  const result = await setup(m.deps)
+  assert.equal(result.url, 'https://hermes-box.tail1.ts.net')
+  assert.match(m.files.get(`${UNITS}/hermes-hq-hermes.service`), /^Environment="HERMES_HOME=\/opt\/native-rev\/data"$/m)
+  const restarts = () => m.ran.filter((c) => c === 'systemctl --user restart hermes-hq-hermes.service').length
+  assert.ok(restarts() >= 1)
+  assert.ok(m.ran.indexOf('systemctl --user restart hermes-hq-hermes.service') < m.ran.findIndex((c) => c.includes('dashboard register')), 'before anything is registered for it')
+  // Up to date now: the next run leaves it alone.
+  const after = restarts()
+  await setup(m.deps)
+  assert.equal(restarts(), after)
+})

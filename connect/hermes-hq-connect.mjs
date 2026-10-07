@@ -499,6 +499,20 @@ export async function setup(deps, { dryRun = false } = {}) {
     return null
   }
   let backend = await findBackend()
+  // A background Hermes this setup started before it asked Hermes for its folder runs with the default one, not this
+  // Hermes's: started again with it.
+  const ownJob = (() => { try { return jobs.loaded('hermes') ? deps.read(jobs.file('hermes')) : null } catch { return null } })()
+  if (backend && ownJob !== null && !ownJob.includes(`HERMES_HOME=${home}"`) && !ownJob.includes(`<key>HERMES_HOME</key><string>${xml(home)}</string>`)) {
+    if (dryRun) todo(`start Hermes in the background again with its own folder (open chats pause for a few seconds)`)
+    else {
+      todo('Starting Hermes in the background again with its own folder (open chats pause for a few seconds)')
+      deps.write(jobs.file('hermes'), jobs.text('hermes', hermesJob(deps, hermes, home)), 0o644)
+      const failed = jobs.start('hermes')
+      backend = null
+      for (let i = 0; i < 60 && !backend && !failed; i++) { await deps.sleep(2000); backend = await findBackend() }
+      if (!backend) throw new Stop(`Hermes didn't come back in the background${failed ? ': ' + relayable(failed) : ''}. Its log is hermes.log in ~/.config/hermes-hq-edge. Run this again.`)
+    }
+  }
   const running = Boolean(backend)
   // A dry run carries on as if Hermes were started at its default address.
   if (!backend && dryRun) {
