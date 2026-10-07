@@ -4,7 +4,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { setup, off, status, nousAccount, hermesBackends, choosePort, publicUrl, connectLink, NextStep, nextStepText } from '../hermes-hq-connect.mjs'
+import { setup, off, status, nousAccount, hermesHome, hermesBackends, choosePort, publicUrl, connectLink, NextStep, nextStepText, relayable } from '../hermes-hq-connect.mjs'
 
 const HOME = '/Users/new'
 const jwt = (claims) => ['e30', Buffer.from(JSON.stringify(claims)).toString('base64url'), 'x'.repeat(120)].join('.')
@@ -251,16 +251,23 @@ test('status and off see the gatekeeper from before the rename', async () => {
 
 const LHOME = '/home/ubuntu'
 const UNITS = `${LHOME}/.config/systemd/user`
-/** A Linux computer as the tool would find it: systemd user services, loginctl lingering, Tailscale's operator. */
-function linux({ running = true, nous = true, linger = false, lingerWithoutSudo = false, operator = false, systemd = true, hermesStarts = true, units = {} } = {}) {
+/** This account's own Tailscale, as setup installs it on Linux without admin rights. */
+const OWN_TS = `${LHOME}/.config/hermes-hq-edge/tailscale`
+/** A Linux computer as the tool would find it: systemd user services, loginctl lingering, Tailscale's operator.
+ *  `hermesDir` is the folder Hermes says is its own (`hermes config path`); `tailscale: 'none'` is a computer without it,
+ *  where setup installs this account's own (its download checks out unless `checksum: 'bad'`). */
+function linux({ running = true, nous = true, linger = false, lingerWithoutSudo = false, operator = false, systemd = true, hermesStarts = true, units = {}, hermesDir = `${LHOME}/.hermes`, tailscale = 'system', checksum = 'ok' } = {}) {
   const files = new Map(Object.entries(units)), ran = [], logs = [], active = new Set()
   let backendNous = false, funnel = {}, lingering = linger, isOperator = operator
-  if (nous) files.set(`${LHOME}/.hermes/auth.json`, JSON.stringify({ providers: { nous: { access_token: jwt({ sub: 'user_owner', iss: 'https://portal.nousresearch.com' }) } } }))
-  files.set(`${LHOME}/.hermes/.env`, '')
+  // This account's own Tailscale: signed in once the person opens its link.
+  const own = { signedIn: false, loginStarted: false }
+  if (nous) files.set(`${hermesDir}/auth.json`, JSON.stringify({ providers: { nous: { access_token: jwt({ sub: 'user_owner', iss: 'https://portal.nousresearch.com' }) } } }))
+  files.set(`${hermesDir}/.env`, '')
   const unitOf = (args) => args[args.length - 1]
+  const tsRunning = { BackendState: 'Running', CertDomains: ['hermes-box.tail1.ts.net'], Self: { DNSName: 'hermes-box.tail1.ts.net.', Capabilities: ['https://tailscale.com/cap/funnel-ports?ports=443,8443,10000'] } }
   const deps = {
-    home: LHOME, uid: 1000, user: 'ubuntu', hostname: 'hermes-box.lan', platform: 'linux', node: '/usr/bin/node', path: '/usr/local/bin:/usr/bin:/bin',
-    which: (name) => (name === 'hermes' ? `${LHOME}/.local/bin/hermes` : name === 'tailscale' ? '/usr/bin/tailscale' : ''),
+    home: LHOME, uid: 1000, user: 'ubuntu', hostname: 'hermes-box.lan', platform: 'linux', arch: 'x64', node: '/usr/bin/node', path: '/usr/local/bin:/usr/bin:/bin',
+    which: (name) => (name === 'hermes' ? `${LHOME}/.local/bin/hermes` : name === 'tailscale' && tailscale === 'system' ? '/usr/bin/tailscale' : ''),
     exists: (p) => files.has(p) || p.endsWith('hermes-hq-edge.mjs') && !p.startsWith(LHOME),
     read: (p) => { if (p.endsWith('hermes-hq-edge.mjs') && !p.startsWith(LHOME)) return EDGE_SOURCE; if (!files.has(p)) throw new Error('ENOENT ' + p); return files.get(p) },
     write: (p, text) => files.set(p, text),
@@ -271,10 +278,31 @@ function linux({ running = true, nous = true, linger = false, lingerWithoutSudo 
     fetchJson: async (url) => {
       if (url.includes(':9119/api/status')) return running ? { status: 200, body: { auth_required: backendNous, auth_providers: backendNous ? ['nous'] : [], auth_flows: backendNous ? ['cookie', 'native_pkce'] : ['cookie'] } } : { status: 0, body: null }
       if (url.includes(':9139/api/status')) return active.has('hermes-hq-edge.service') ? { status: 200, body: {} } : { status: 0, body: null }
+      if (url === 'https://pkgs.tailscale.com/stable/?mode=json') return { status: 200, body: { TarballsVersion: '1.102.5', Tarballs: { amd64: 'tailscale_1.102.5_amd64.tgz', arm64: 'tailscale_1.102.5_arm64.tgz' } } }
       return { status: 0, body: null }
     },
     run: (cmd, args, opts = {}) => {
       ran.push([cmd, ...args].join(' ') + (opts.interactive ? ' [tty]' : ''))
+      if (cmd.endsWith('hermes') && args[0] === 'config' && args[1] === 'path') return { status: 0, stdout: `${hermesDir}/config.yaml\n` }
+      // Tailscale's own download for this account: the tarball, its published checksum, and what's in it.
+      if (cmd === 'curl' && args.includes('-o')) { files.set(args[args.indexOf('-o') + 1], 'tgz'); return { status: 0, stdout: '' } }
+      if (cmd === 'curl' && args[args.length - 1].endsWith('.sha256')) return { status: 0, stdout: 'abc123\n' }
+      if (cmd === 'sha256sum') return { status: 0, stdout: `${checksum === 'ok' ? 'abc123' : 'f00d99'}  ${args[0]}\n` }
+      if (cmd === 'tar') { const dir = args[args.indexOf('-C') + 1]; files.set(`${dir}/tailscale`, 'elf'); files.set(`${dir}/tailscaled`, 'elf'); return { status: 0 } }
+      if (cmd === `${OWN_TS}/tailscale`) {
+        if (!active.has('hermes-hq-tailscale.service')) return { status: 1, stdout: '', stderr: 'failed to connect to local tailscaled; it doesn\'t appear to be running' }
+        if (args[0] === 'up') { own.loginStarted = true; return { status: 1, stdout: '', stderr: '\nTo authenticate, visit:\n\n\thttps://login.tailscale.com/a/own123\n\ntimeout waiting for Tailscale service to enter a Running state' } }
+        if (args[0] === 'status') return { status: 0, stdout: JSON.stringify(own.signedIn ? tsRunning : { BackendState: 'NeedsLogin', AuthURL: own.loginStarted ? 'https://login.tailscale.com/a/own123' : '', Self: {} }) }
+        // Its own: serve and Funnel are this account's to change, no operator needed.
+        if (args[0] === 'serve') return { status: 0, stdout: JSON.stringify(funnel) }
+        if (args[0] === 'funnel' && args[1] === '--bg') {
+          const port = args[2].split('=')[1]
+          funnel = { TCP: { [port]: { HTTPS: true } }, Web: { [`hermes-box.tail1.ts.net:${port}`]: { Handlers: { '/': { Proxy: args[3] } } } }, AllowFunnel: { [`hermes-box.tail1.ts.net:${port}`]: true } }
+          return { status: 0 }
+        }
+        if (args[0] === 'funnel' && args[2] === 'off') { funnel = {}; return { status: 0 } }
+        return { status: 1, stderr: 'unexpected: ' + args.join(' ') }
+      }
       if (cmd === '/bin/ps') return { status: 0, stdout: running ? `${LHOME}/.local/bin/hermes serve --port 9119\n` : '' }
       if (cmd === '/bin/sh') return { status: 0, stdout: [...files.keys()].filter((k) => k.startsWith(UNITS + '/')).join('\n') }
       if (cmd === 'systemctl') {
@@ -286,7 +314,7 @@ function linux({ running = true, nous = true, linger = false, lingerWithoutSudo 
           const unit = unitOf(args)
           active.add(unit)
           if (unit === 'hermes-hq-hermes.service') running = hermesStarts
-          if (/hermes/.test(unit) && unit !== 'hermes-hq-edge.service') backendNous = files.get(`${LHOME}/.hermes/.env`).includes('OAUTH_CLIENT_ID')
+          if (/hermes/.test(unit) && !['hermes-hq-edge.service', 'hermes-hq-tailscale.service'].includes(unit)) backendNous = files.get(`${hermesDir}/.env`).includes('OAUTH_CLIENT_ID')
           return { status: 0 }
         }
         if (verb === 'disable') { active.delete(unitOf(args)); if (unitOf(args) === 'hermes-hq-hermes.service') running = false; return { status: 0 } }
@@ -295,10 +323,10 @@ function linux({ running = true, nous = true, linger = false, lingerWithoutSudo 
       if (cmd === 'loginctl' && args[0] === 'enable-linger') { if (lingerWithoutSudo) lingering = true; return { status: lingerWithoutSudo ? 0 : 1 } }
       if (cmd === 'sudo' && args[0] === 'loginctl') { lingering = true; return { status: 0 } }
       if (cmd === 'sudo' && args[0] === '/usr/bin/tailscale' && args[1] === 'set') { isOperator = true; return { status: 0 } }
-      if (cmd.endsWith('hermes') && args[0] === 'auth') { files.set(`${LHOME}/.hermes/auth.json`, JSON.stringify({ nous: { access_token: jwt({ sub: 'user_owner', iss: 'https://portal.nousresearch.com' }) } })); return { status: 0 } }
-      if (cmd.endsWith('hermes') && args[0] === 'dashboard') { files.set(`${LHOME}/.hermes/.env`, `HERMES_DASHBOARD_OAUTH_CLIENT_ID=agent:abc\nHERMES_DASHBOARD_PUBLIC_URL=${args[5].replace('/auth/callback', '')}\n`); return { status: 0 } }
+      if (cmd.endsWith('hermes') && args[0] === 'auth') { files.set(`${hermesDir}/auth.json`, JSON.stringify({ nous: { access_token: jwt({ sub: 'user_owner', iss: 'https://portal.nousresearch.com' }) } })); return { status: 0 } }
+      if (cmd.endsWith('hermes') && args[0] === 'dashboard') { files.set(`${hermesDir}/.env`, `HERMES_DASHBOARD_OAUTH_CLIENT_ID=agent:abc\nHERMES_DASHBOARD_PUBLIC_URL=${args[5].replace('/auth/callback', '')}\n`); return { status: 0 } }
       if (cmd === '/usr/bin/tailscale' && args[0] === 'set') return { status: isOperator ? 0 : 1, stderr: isOperator ? '' : 'Access denied: prefs write access denied' }
-      if (cmd === '/usr/bin/tailscale' && args[0] === 'status') return { status: 0, stdout: JSON.stringify({ BackendState: 'Running', CertDomains: ['hermes-box.tail1.ts.net'], Self: { DNSName: 'hermes-box.tail1.ts.net.', Capabilities: ['https://tailscale.com/cap/funnel-ports?ports=443,8443,10000'] } }) }
+      if (cmd === '/usr/bin/tailscale' && args[0] === 'status') return { status: 0, stdout: JSON.stringify(tsRunning) }
       // Without operator rights Tailscale won't say what it serves: the tool must not guess a free port.
       if (cmd === '/usr/bin/tailscale' && args[0] === 'serve') return isOperator ? { status: 0, stdout: JSON.stringify(funnel) } : { status: 1, stdout: '', stderr: 'Access denied' }
       if (cmd === '/usr/bin/tailscale' && args[0] === 'funnel' && args[1] === '--bg') {
@@ -311,7 +339,7 @@ function linux({ running = true, nous = true, linger = false, lingerWithoutSudo 
       return { status: 0, stdout: '' }
     },
   }
-  return { deps, files, ran, logs, state: () => ({ active, lingering, isOperator, running, funnel }) }
+  return { deps, files, ran, logs, own, state: () => ({ active, lingering, isOperator, running, funnel }) }
 }
 
 test('Linux, fresh: starts Hermes as a systemd user service, keeps it past logout, makes this account Tailscale\'s operator, and finishes with the QR', async () => {
@@ -461,7 +489,7 @@ function asAgent(m, { sudo = false, funnelBlocked = false } = {}) {
     }
     return run(cmd, args, opts)
   }
-  const approve = () => { m.files.set(`${m.deps.home}/.hermes/auth.json`, JSON.stringify({ nous: { access_token: jwt({ sub: 'user_owner', iss: 'https://portal.nousresearch.com' }) } })); live.clear() }
+  const approve = (dir = `${m.deps.home}/.hermes`) => { m.files.set(`${dir}/auth.json`, JSON.stringify({ nous: { access_token: jwt({ sub: 'user_owner', iss: 'https://portal.nousresearch.com' }) } })); live.clear() }
   return { ...m, spawned, approve }
 }
 const nextStep = async (work) => { try { await work } catch (error) { if (error instanceof NextStep) return error; throw error } throw new Error('expected a NEXT STEP') }
@@ -534,3 +562,135 @@ test('agent on Linux with passwordless sudo: lingering and the Tailscale operato
   assert.ok(!m.ran.some((c) => c.endsWith('[tty]')))
 })
 
+
+// ---- Hermes's folder is Hermes's to say; Tailscale without admin rights; nothing relayed names a file ----------------
+
+test('Hermes in its own folder (a profile, HERMES_HOME): its sign-in and settings are read there, and the background Hermes uses it', async () => {
+  // Like a Hermes whose HERMES_HOME is /opt/native-rev/data and whose terminal runs commands with another HOME.
+  const m = asAgent(linux({ running: false, linger: true, operator: true, hermesDir: '/opt/native-rev/data' }))
+  const result = await setup(m.deps)
+  assert.equal(result.url, 'https://hermes-box.tail1.ts.net')
+  assert.deepEqual(m.spawned, [], 'already signed in there: no second sign-in')
+  assert.equal(m.files.has(`${LHOME}/.hermes/auth.json`), false)
+  assert.deepEqual(JSON.parse(m.files.get(`${LHOME}/.config/hermes-hq-edge/config.json`)).owners, ['user_owner'])
+  assert.match(m.files.get('/opt/native-rev/data/.env'), /HERMES_DASHBOARD_PUBLIC_URL=https:\/\/hermes-box\.tail1\.ts\.net/)
+  assert.match(m.files.get(`${UNITS}/hermes-hq-hermes.service`), /^Environment="HERMES_HOME=\/opt\/native-rev\/data"$/m)
+})
+
+test('Hermes\'s folder: from `hermes config path`, else HERMES_HOME, else ~/.hermes', () => {
+  const deps = (stdout, env = {}) => ({ home: '/home/u', env, run: () => ({ status: stdout === null ? 1 : 0, stdout: stdout ?? '' }) })
+  assert.equal(hermesHome(deps('/home/u/.hermes/profiles/rev/config.yaml\n'), '/x/hermes'), '/home/u/.hermes/profiles/rev')
+  assert.equal(hermesHome(deps('Warning: something\n/srv/h/config.yaml\n'), '/x/hermes'), '/srv/h')
+  assert.equal(hermesHome(deps(null, { HERMES_HOME: '~/h' }), '/x/hermes'), '/home/u/h')
+  assert.equal(hermesHome(deps(null), '/x/hermes'), '/home/u/.hermes')
+})
+
+test('agent: a Nous sign-in made earlier is imported without a link, and setup carries on', async () => {
+  const m = asAgent(linux({ running: false, linger: true, operator: true, nous: false, hermesDir: '/opt/native-rev/data' }))
+  // `hermes auth add nous` finds the shared sign-in and imports it, then ends: no link, no code.
+  m.deps.spawnDetached = (cmd, args, log) => {
+    m.spawned.push([cmd, ...args].join(' '))
+    m.files.set(log, 'Found existing Nous OAuth credentials at /opt/native-rev/data/shared/nous_auth.json\nImport these credentials? [Y/n]: Rehydrating Nous session from shared credentials...\nImported nous OAuth credentials: "me@example.com"\n')
+    m.approve('/opt/native-rev/data')
+    return 77
+  }
+  const result = await setup(m.deps)
+  assert.equal(result.url, 'https://hermes-box.tail1.ts.net')
+  assert.equal(m.spawned.length, 1)
+})
+
+test('agent: a Nous sign-in that ends without signing in goes back to the agent, with no file paths in what it says', async () => {
+  const m = asAgent(machine({ nous: false }))
+  m.deps.spawnDetached = (cmd, args, log) => {
+    m.spawned.push([cmd, ...args].join(' '))
+    m.files.set(log, 'Found existing Nous OAuth credentials at /Users/new/.hermes/shared/nous_auth.json\nImport these credentials? [Y/n]: Rehydrating Nous session from ~/.hermes/shared/nous_auth.json...\n')
+    return 78
+  }
+  const step = await nextStep(setup(m.deps))
+  assert.equal(step.forWhom, 'agent')
+  assert.match(step.message, /Run this same command again/)
+  assert.doesNotMatch(step.message, /nous_auth\.json|\/Users\/|~\//)
+  assert.doesNotMatch(step.message, /terminal/)
+})
+
+test('relayable: paths become …, links stay', () => {
+  assert.equal(relayable('at /opt/x/shared/nous_auth.json\nthen open https://login.tailscale.com/a/abc (or ~/.hermes/auth.json)'),
+    'at … then open https://login.tailscale.com/a/abc (or …)')
+})
+
+test('agent on Linux with no Tailscale and no admin rights: installs this account\'s own Tailscale, no password, and the person only opens its sign-in link', async () => {
+  const m = asAgent(linux({ running: false, linger: true, tailscale: 'none' }))
+  const step = await nextStep(setup(m.deps))
+  assert.equal(step.forWhom, 'person')
+  assert.equal(step.message, 'Sign in to Tailscale for the computer running Hermes (free; your phone doesn\'t need it): open https://login.tailscale.com/a/own123')
+  // Tailscale's static build, checked against its published checksum, unpacked beside the gatekeeper.
+  assert.ok(m.ran.includes(`curl -fsSL --retry 3 -o ${OWN_TS}/tailscale_1.102.5_amd64.tgz https://pkgs.tailscale.com/stable/tailscale_1.102.5_amd64.tgz`))
+  assert.ok(m.ran.includes(`tar -xzf ${OWN_TS}/tailscale_1.102.5_amd64.tgz -C ${OWN_TS}/bin --strip-components=1`))
+  assert.equal(m.files.has(`${OWN_TS}/tailscale_1.102.5_amd64.tgz`), false, 'the download is removed')
+  assert.match(m.files.get(`${OWN_TS}/tailscale`), new RegExp(`^exec "${OWN_TS}/bin/tailscale" --socket="${OWN_TS}/tailscaled.sock" "\\$@"$`, 'm'))
+  const unit = m.files.get(`${UNITS}/hermes-hq-tailscale.service`)
+  assert.deepEqual(execStartWords(/^ExecStart=(.*)$/m.exec(unit)[1]), [`${OWN_TS}/bin/tailscaled`, '--tun=userspace-networking', `--socket=${OWN_TS}/tailscaled.sock`, `--statedir=${OWN_TS}/state`, '--port=0'])
+  assert.ok(m.state().active.has('hermes-hq-tailscale.service'))
+  // Nothing asks for a password, and nothing is done as root.
+  assert.deepEqual(m.ran.filter((c) => c.startsWith('sudo')), ['sudo -n true'])
+  assert.ok(!m.ran.some((c) => c.includes('--operator') || c.includes('install.sh') || c.endsWith('[tty]')))
+  // Run again before the person has opened it: the same link, no second download.
+  assert.equal((await nextStep(setup(m.deps))).message, step.message)
+  assert.equal(m.ran.filter((c) => c.startsWith('curl -fsSL --retry 3 -o')).length, 1)
+  // Signed in: the next run goes all the way through this account's own Tailscale.
+  m.own.signedIn = true
+  const result = await setup(m.deps)
+  assert.equal(result.url, 'https://hermes-box.tail1.ts.net')
+  assert.ok(m.ran.includes(`${OWN_TS}/tailscale funnel --bg --https=443 http://127.0.0.1:9139`))
+  assert.match(m.logs.join('\n'), /DONE\. Hermes HQ can reach this computer at: https:\/\/hermes-box\.tail1\.ts\.net/)
+  // status and off see it too; off stops it (still signed in for a later setup).
+  assert.equal((await status(m.deps)).url, 'https://hermes-box.tail1.ts.net')
+  await off(m.deps)
+  assert.ok(m.ran.includes(`${OWN_TS}/tailscale funnel --https=443 off`))
+  assert.equal(m.files.has(`${UNITS}/hermes-hq-tailscale.service`), false)
+  assert.ok(!m.state().active.has('hermes-hq-tailscale.service'))
+  assert.ok(m.files.has(`${OWN_TS}/bin/tailscaled`), 'still installed')
+  // Set up again: started again, still signed in, nothing downloaded.
+  assert.equal((await setup(m.deps)).url, 'https://hermes-box.tail1.ts.net')
+  assert.ok(m.state().active.has('hermes-hq-tailscale.service'))
+  assert.equal(m.ran.filter((c) => c.startsWith('curl -fsSL --retry 3 -o')).length, 1)
+})
+
+test('own Tailscale: a download that doesn\'t match its checksum stops, and nothing is installed', async () => {
+  const m = asAgent(linux({ running: false, linger: true, tailscale: 'none', checksum: 'bad' }))
+  await assert.rejects(setup(m.deps), (error) => !(error instanceof NextStep) && /didn't match Tailscale's checksum/.test(error.message))
+  assert.ok(!m.ran.some((c) => c.startsWith('tar ')))
+  assert.equal(m.files.has(`${OWN_TS}/tailscale_1.102.5_amd64.tgz`), false)
+  assert.equal(m.files.has(`${UNITS}/hermes-hq-tailscale.service`), false)
+})
+
+test('Linux at a terminal, no Tailscale and no admin rights: the same own Tailscale, signed in at the terminal', async () => {
+  const m = linux({ running: false, linger: true, tailscale: 'none' })
+  const run = m.deps.run
+  m.deps.run = (cmd, args, opts = {}) => {
+    // `tailscale up` at a terminal shows its link and waits until the person has signed in.
+    if (cmd === `${OWN_TS}/tailscale` && args[0] === 'up' && opts.interactive) { m.ran.push([cmd, ...args].join(' ') + ' [tty]'); m.own.signedIn = true; return { status: 0 } }
+    return run(cmd, args, opts)
+  }
+  const result = await setup(m.deps)
+  assert.equal(result.url, 'https://hermes-box.tail1.ts.net')
+  assert.ok(m.ran.includes(`${OWN_TS}/tailscale up [tty]`))
+  assert.ok(!m.ran.some((c) => c.startsWith('sudo') && c.includes('tailscale')))
+})
+
+test('--dry-run on Linux without Tailscale says it would install this account\'s own, and installs nothing', async () => {
+  const m = linux({ running: false, tailscale: 'none' })
+  const result = await setup(m.deps, { dryRun: true })
+  assert.equal(result.dryRun, true)
+  assert.match(m.logs.join('\n'), /would install Tailscale for this account only \(no password needed\)/)
+  assert.ok(!m.ran.some((c) => /^(curl|tar|systemctl --user (restart|enable))/.test(c)))
+})
+
+test('own Tailscale that never answers stops with where its messages are, rather than asking to run again forever', async () => {
+  const m = asAgent(linux({ running: false, linger: true, tailscale: 'none' }))
+  const run = m.deps.run
+  m.deps.run = (cmd, args, opts) => cmd === `${OWN_TS}/tailscale` ? (m.ran.push([cmd, ...args].join(' ')), { status: 1, stdout: '', stderr: 'failed to connect to local tailscaled' }) : run(cmd, args, opts)
+  await assert.rejects(setup(m.deps), (error) => !(error instanceof NextStep) && /journalctl --user -u hermes-hq-tailscale/.test(error.message))
+  // Its output goes to the journal, which rotates it: no log file of its own that grows forever.
+  assert.doesNotMatch(m.files.get(`${UNITS}/hermes-hq-tailscale.service`), /^Standard(Output|Error)=/m)
+})

@@ -29,11 +29,12 @@ whenever you log in or the computer starts. It only stops when you have to do so
 1. **Sign in to Nous** in your browser, if Hermes on this computer isn't signed in already. On a computer without a
    screen it shows a link and a code: open the link in any browser, even your phone's.
 2. **Install Tailscale on this computer and sign in.** Not on your phone. Tailscale gives the computer a secure
-   public address.
+   public address. On Linux it installs Tailscale for you (just for your account if you have no admin rights, so no
+   password); you only open its sign-in link.
 3. **Turn on MagicDNS and HTTPS Certificates** in Tailscale's admin page. It gives you the link.
 4. **Click Allow** if Tailscale asks you to allow Funnel, its public-address feature, for this computer.
-5. **On Linux, your password once (sudo)**, if the system asks: so Hermes and the gatekeeper keep running after you
-   log out, and so your account may manage Tailscale.
+5. **On Linux, maybe your password once (sudo)**, if the system asks: so Hermes and the gatekeeper keep running after
+   you log out, and, if Tailscale was already installed, so your account may manage it.
 
 When it's done, it shows a **QR code**. Point your iPhone's Camera at it and tap **Open in Hermes HQ**. Hermes HQ
 opens with your computer's address filled in. Tap **Sign in with Nous**, and you're connected.
@@ -81,7 +82,11 @@ for that computer. Your phone needs only Hermes HQ.
   in place.)
 - If no Hermes backend is running, setup starts `hermes serve` as the `com.hermes-hq.hermes` LaunchAgent, or the
   `hermes-hq-hermes.service` user service on Linux: Hermes's own command and arguments, so `hermes update` restarts
-  it. Its log is `~/.config/hermes-hq-edge/hermes.log`.
+  it. Its log is `~/.config/hermes-hq-edge/hermes.log`. Setup asks Hermes where its own folder is (`hermes config
+  path`: a profile's, `HERMES_HOME`, or `~/.hermes`) and reads Hermes's Nous sign-in there.
+- On Linux without Tailscale and without admin rights, setup installs Tailscale's own build for your account alone in
+  `~/.config/hermes-hq-edge/tailscale` (checked against Tailscale's published checksum) and runs it as the
+  `hermes-hq-tailscale.service` user service, with userspace networking: no root, no password. `off` stops it.
 - `connect/qr.mjs` draws the QR code in the terminal.
 - `connect/test/` holds the tests: `node --test connect/test/*.test.mjs`.
 

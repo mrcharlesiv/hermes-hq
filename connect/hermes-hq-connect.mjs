@@ -6,8 +6,10 @@
 //   1. Hermes is installed, and a backend (hermes serve / hermes dashboard) answers. With none running, it starts
 //      `hermes serve` in the background: a LaunchAgent on a Mac, a systemd user service on Linux, both run the way
 //      Hermes's own updater knows how to restart.
-//   2. Hermes is signed in to Nous on this computer (if not, it starts the Nous sign-in).
-//   3. Tailscale is on this computer, signed in, with HTTPS names and Funnel allowed (it says what to do if not).
+//   2. Hermes is signed in to Nous on this computer (if not, it starts the Nous sign-in). Hermes says where its folder
+//      is (a profile's, HERMES_HOME, or ~/.hermes): its sign-in and settings are read there.
+//   3. Tailscale is on this computer, signed in, with HTTPS names and Funnel allowed (it says what to do if not). On
+//      Linux without admin rights it installs Tailscale for this account alone (userspace networking, no password).
 //   4. The dashboard is registered with Nous for the public address (hermes dashboard register).
 //   5. Hermes is restarted so Nous sign-in turns on, and its own sign-in gate is checked.
 //   6. hermes-hq-edge (the owner-only gatekeeper) is installed with this computer's Nous account as the owner.
@@ -46,7 +48,11 @@ const FUNNEL_PORTS = [443, 8443, 10000]
 /** Everything the tool touches on the computer, so tests can stand in for a fresh or a finished machine. */
 export function systemDeps() {
   return {
-    home: os.homedir(),
+    // The account's own home, where launchd and systemd look for its jobs: Hermes's terminal may run commands with
+    // HOME set to a folder of its own.
+    home: (() => { try { return os.userInfo().homedir || os.homedir() } catch { return os.homedir() } })(),
+    env: process.env,
+    arch: process.arch,
     platform: process.platform,
     user: (() => { try { return os.userInfo().username } catch { return process.env.USER ?? '' } })(),
     hostname: os.hostname(),
@@ -91,9 +97,19 @@ export function systemDeps() {
 
 // ---- reading the machine -------------------------------------------------------------------------------------
 
+/** Hermes's own folder as Hermes resolves it (a profile's, HERMES_HOME, or ~/.hermes): where its Nous sign-in and
+ *  settings are. Asked, not guessed: Hermes's terminal can run commands with another HOME. */
+export function hermesHome(deps, hermes) {
+  const r = hermes ? deps.run(hermes, ['config', 'path'], { timeoutMs: 60_000 }) : null
+  const file = r?.status === 0 ? String(r.stdout ?? '').split('\n').map((l) => l.trim()).filter((l) => l.startsWith('/') && l.endsWith('config.yaml')).pop() : undefined
+  if (file) return path.dirname(file)
+  const env = String(deps.env?.HERMES_HOME ?? '').trim()
+  return env ? env.replace(/^~(?=\/|$)/, deps.home) : path.join(deps.home, '.hermes')
+}
+
 /** The Nous account id (JWT `sub`) of Hermes's own Nous login on this computer, or ''. Only the id leaves here. */
-export function nousAccount(deps) {
-  const file = path.join(deps.home, '.hermes', 'auth.json')
+export function nousAccount(deps, home = path.join(deps.home, '.hermes')) {
+  const file = path.join(home, 'auth.json')
   if (!deps.exists(file)) return ''
   let data
   try { data = JSON.parse(deps.read(file)) } catch { return '' }
@@ -116,8 +132,11 @@ export function findHermes(deps) {
   return deps.which('hermes') || [path.join(deps.home, '.hermes/hermes-agent/venv/bin/hermes'), path.join(deps.home, '.local/bin/hermes')].find((p) => deps.exists(p)) || ''
 }
 
+/** This account's own Tailscale when setup installed one (Linux without admin rights), else the computer's. */
 export function findTailscale(deps) {
-  return deps.which('tailscale') || ['/Applications/Tailscale.app/Contents/MacOS/Tailscale', '/usr/local/bin/tailscale', '/opt/homebrew/bin/tailscale'].find((p) => deps.exists(p)) || ''
+  const own = ownTailscalePaths(deps).cli
+  if (deps.platform === 'linux' && deps.exists(own)) return own
+  return deps.which('tailscale') ||['/Applications/Tailscale.app/Contents/MacOS/Tailscale', '/usr/local/bin/tailscale', '/opt/homebrew/bin/tailscale'].find((p) => deps.exists(p)) || ''
 }
 
 /** Running Hermes web backends: their bind address from the process list (Desktop's private port-0 ones skipped). */
@@ -198,10 +217,11 @@ ${spec.throttle ? `  <key>ThrottleInterval</key><integer>${spec.throttle}</integ
 }
 
 function systemdJobs(deps) {
-  const units = { edge: 'hermes-hq-edge.service', hermes: 'hermes-hq-hermes.service' }
+  const units = { edge: 'hermes-hq-edge.service', hermes: 'hermes-hq-hermes.service', tailscale: 'hermes-hq-tailscale.service' }
   const dir = path.join(deps.home, '.config/systemd/user'), file = (job) => path.join(dir, units[job])
   const ctl = (...args) => deps.run('systemctl', ['--user', ...args])
-  const titles = { edge: 'Hermes HQ gatekeeper (only your Nous account gets in)', hermes: 'Hermes for Hermes HQ (hermes serve)' }
+  const titles = { edge: 'Hermes HQ gatekeeper (only your Nous account gets in)', hermes: 'Hermes for Hermes HQ (hermes serve)',
+    tailscale: 'Tailscale for Hermes HQ (this account\'s own, no admin rights)' }
   return {
     file,
     text: (job, spec) => `[Unit]
@@ -211,9 +231,7 @@ Description=${titles[job]}
 ExecStart=${spec.argv.map(unitWord).join(' ')}
 ${spec.env ? Object.entries(spec.env).map(([k, v]) => `Environment=${unitWord(`${k}=${v}`).replace(/\$\$/g, '$')}`).join('\n') + '\n' : ''}Restart=always
 RestartSec=10
-StandardOutput=append:${spec.out}
-StandardError=append:${spec.err}
-
+${spec.out ? `StandardOutput=append:${spec.out}\n` : ''}${spec.err ? `StandardError=append:${spec.err}\n` : ''}
 [Install]
 WantedBy=default.target
 `,
@@ -258,9 +276,10 @@ function keepRunningAfterLogout(deps, say, dryRun) {
   say(`  ! Hermes and the gatekeeper will stop when you log out. To keep them running, run: sudo loginctl enable-linger ${deps.user}`)
 }
 
-/** Linux: Tailscale lets only root or its operator change Serve and Funnel; the operator is set once, with sudo. */
+/** Linux: Tailscale lets only root or its operator change Serve and Funnel; the operator is set once, with sudo. This
+ *  account's own Tailscale is already its to change. */
 function tailscaleOperator(deps, cli, say, dryRun) {
-  if (deps.platform !== 'linux' || deps.uid === 0) return
+  if (deps.platform !== 'linux' || deps.uid === 0 || cli === ownTailscalePaths(deps).cli) return
   if (deps.run(cli, ['set', `--operator=${deps.user}`]).status === 0) return
   if (dryRun) { say(`  • would let this account manage Tailscale (sudo tailscale set --operator=${deps.user})`); return }
   if (deps.agent) {
@@ -271,6 +290,67 @@ function tailscaleOperator(deps, cli, say, dryRun) {
   if (deps.run('sudo', [cli, 'set', `--operator=${deps.user}`], { interactive: true }).status !== 0) {
     throw new Stop(`Tailscale didn't give this account access. Run "sudo tailscale set --operator=${deps.user}", then run this again.`)
   }
+}
+
+// ---- Tailscale for this account alone (Linux without admin rights) ------------------------------------------------
+
+/** Tailscale's own static build, kept beside the gatekeeper. `tailscale` here is a two-line wrapper that talks to this
+ *  account's tailscaled, so every step uses it the way it uses the computer's. */
+function ownTailscalePaths(deps) {
+  const dir = path.join(edgePaths(deps).dir, 'tailscale')
+  return { dir, bin: path.join(dir, 'bin'), cli: path.join(dir, 'tailscale'), socket: path.join(dir, 'tailscaled.sock'), state: path.join(dir, 'state') }
+}
+
+/** tailscaled with userspace networking needs no admin rights; port 0 keeps clear of a system tailscaled's port. Its
+ *  chatty output goes to the journal, which rotates it (journalctl --user -u hermes-hq-tailscale). */
+function ownTailscaleJob(deps) {
+  const t = ownTailscalePaths(deps)
+  return { argv: [path.join(t.bin, 'tailscaled'), '--tun=userspace-networking', `--socket=${t.socket}`, `--statedir=${t.state}`, '--port=0'] }
+}
+
+const TAILSCALE_ARCH = { x64: 'amd64', arm64: 'arm64', arm: 'arm', ia32: '386', riscv64: 'riscv64' }
+
+/** Installs (once, checked against Tailscale's checksum) and starts this account's own Tailscale; returns its CLI. */
+async function ownTailscale(deps, jobs, say, todo) {
+  const t = ownTailscalePaths(deps)
+  if (!deps.exists(path.join(t.bin, 'tailscaled'))) {
+    const arch = TAILSCALE_ARCH[deps.arch]
+    const index = arch ? (await deps.fetchJson('https://pkgs.tailscale.com/stable/?mode=json', 30_000)).body : null
+    const tarball = index?.Tarballs?.[arch]
+    if (!tarball) throw new Stop(`Couldn't find Tailscale's download for this computer (${deps.arch}). Install Tailscale on it (https://tailscale.com/download/linux), then run this again.`)
+    todo(`Installing Tailscale${index.TarballsVersion ? ' ' + index.TarballsVersion : ''} for this account only (no password needed)`)
+    const url = `https://pkgs.tailscale.com/stable/${tarball}`, file = path.join(t.dir, tarball)
+    deps.run('mkdir', ['-p', t.bin])
+    const got = deps.run('curl', ['-fsSL', '--retry', '3', '-o', file, url], { timeoutMs: 10 * 60_000 })
+    const want = got.status === 0 ? deps.run('curl', ['-fsSL', '--retry', '3', url + '.sha256'], { timeoutMs: 60_000 }).stdout.trim() : ''
+    const have = want ? deps.run('sha256sum', [file]).stdout.trim().split(/\s+/)[0] : ''
+    const unpacked = Boolean(have) && have === want && deps.run('tar', ['-xzf', file, '-C', t.bin, '--strip-components=1']).status === 0
+    deps.remove(file)
+    if (!unpacked) throw new Stop('Downloading Tailscale didn\'t finish (or it didn\'t match Tailscale\'s checksum). Run this again.')
+  }
+  deps.write(t.cli, `#!/bin/sh\n# This account's own Tailscale (set up by Hermes HQ): the tailscale command, talking to its own tailscaled.\nexec "${path.join(t.bin, 'tailscale')}" --socket="${t.socket}" "$@"\n`, 0o755)
+  const text = jobs.text('tailscale', ownTailscaleJob(deps))
+  const same = (() => { try { return deps.read(jobs.file('tailscale')) === text } catch { return false } })()
+  if (same && jobs.loaded('tailscale')) return t.cli
+  keepRunningAfterLogout(deps, say, false)
+  deps.write(jobs.file('tailscale'), text, 0o644)
+  const failed = jobs.start('tailscale')
+  if (failed) throw new Stop('Tailscale didn\'t start: ' + relayable(failed))
+  // Ready once it answers on its own socket.
+  for (let i = 0; i < 20; i++) {
+    try { if ('BackendState' in JSON.parse(deps.run(t.cli, ['status', '--json'], { timeoutMs: 15_000 }).stdout)) return t.cli } catch {}
+    await deps.sleep(1000)
+  }
+  throw new Stop('Tailscale didn\'t start on this computer. Its messages: journalctl --user -u hermes-hq-tailscale. Then run this again.')
+}
+
+/** Tailscale's sign-in link while it waits for one: `tailscale up` asks for it, or says the one already waiting. */
+function tailscaleSignInLink(deps, cli) {
+  const waiting = () => { try { return JSON.parse(deps.run(cli, ['status', '--json'], { timeoutMs: 15_000 }).stdout).AuthURL || '' } catch { return '' } }
+  const already = waiting()
+  if (already) return already
+  const r = deps.run(cli, ['up', '--timeout=15s'], { timeoutMs: 30_000 })
+  return /https:\/\/login\.tailscale\.com\/\S+/.exec(r.stdout + r.stderr)?.[0] ?? waiting()
 }
 
 export function tailscaleState(deps, cli) {
@@ -354,10 +434,11 @@ function edgeJob(deps) {
 
 /** `hermes serve` (headless, 127.0.0.1:9119), Hermes's own argv unwrapped: `hermes update` finds a launchd backend by
  *  its ProgramArguments and a systemd one by its MainPID, and restarts it rather than starting a second copy. PATH is
- *  the one this was run with, so the agent's tools find what they find in a terminal. */
-export function hermesJob(deps, hermes) {
+ *  the one this was run with, so the agent's tools find what they find in a terminal; HERMES_HOME is the folder Hermes
+ *  said is its own, so the phone reaches this Hermes (its profile, its sign-in), not a fresh one. */
+export function hermesJob(deps, hermes, home = path.join(deps.home, '.hermes')) {
   const log = path.join(edgePaths(deps).dir, 'hermes.log')
-  return { argv: [hermes, 'serve', '--port', '9119'], env: { PATH: deps.path || '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin' }, out: log, err: log, throttle: 10 }
+  return { argv: [hermes, 'serve', '--port', '9119'], env: { PATH: deps.path || '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin', HERMES_HOME: home }, out: log, err: log, throttle: 10 }
 }
 
 // ---- the steps -------------------------------------------------------------------------------------------------
@@ -365,6 +446,9 @@ export function hermesJob(deps, hermes) {
 class Stop extends Error { constructor(message, code = 2) { super(message); this.code = code } }
 /** Agent mode: something to do before running again. `forWhom` is 'person' (relay it word for word) or 'agent'. */
 export class NextStep extends Stop { constructor(forWhom, message) { super(message, 3); this.forWhom = forWhom } }
+/** Another program's words, safe to pass on in a chat: Hermes sends any file named by its full path along with the
+ *  message (it once sent a Nous sign-in file that way), so paths become "…". Links are left as they are. */
+export const relayable = (text) => String(text ?? '').replace(/(^|[\s"'(=])(?:~\/|\/)[^\s"')]+/g, '$1…').replace(/\s+/g, ' ').trim()
 export const nextStepText = (step) => step.forWhom === 'person'
   ? `NEXT STEP for the person (send them this, word for word, then wait until they say it's done):\n  ${step.message}\nThen run this same command again.`
   : `NEXT STEP for you, the agent:\n  ${step.message}\nThen run this same command again.`
@@ -404,6 +488,9 @@ export async function setup(deps, { dryRun = false } = {}) {
   const hermes = findHermes(deps)
   if (!hermes) throw new Stop(`Hermes isn't installed on ${computer}. Install it first (https://hermes-agent.nousresearch.com/docs/), then run this again.`)
   done('Hermes is installed')
+  // Hermes's own folder (its profile, HERMES_HOME, or ~/.hermes): its sign-in, its settings, and the background
+  // Hermes's HERMES_HOME.
+  const home = hermesHome(deps, hermes)
   const findBackend = async () => {
     for (const address of hermesBackends(deps)) {
       const r = await deps.fetchJson(`http://${address}/api/status`)
@@ -421,7 +508,7 @@ export async function setup(deps, { dryRun = false } = {}) {
   } else if (!backend) {
     todo(`Starting Hermes in the background, so your phone can reach it any time (it starts again when ${mac ? 'you log in' : 'this computer starts'})`)
     keepRunningAfterLogout(deps, say, dryRun)
-    deps.write(jobs.file('hermes'), jobs.text('hermes', hermesJob(deps, hermes)), 0o644)
+    deps.write(jobs.file('hermes'), jobs.text('hermes', hermesJob(deps, hermes, home)), 0o644)
     const failed = jobs.start('hermes')
     const yourself = `Start it yourself with "hermes serve" in another ${mac ? 'Terminal window' : 'terminal'}, leave it open, then run this again.`
     if (failed) { jobs.remove('hermes'); throw new Stop(`Hermes didn't start in the background: ${failed}. ${yourself}`) }
@@ -435,26 +522,32 @@ export async function setup(deps, { dryRun = false } = {}) {
   }
   if (running || !dryRun) done(`Hermes is running (${backend})`)
 
-  // 2. Nous sign-in on this computer: its account becomes the gateway's owner.
-  let owner = nousAccount(deps)
+  // 2. Nous sign-in on this computer: its account becomes the gateway's owner. Read from Hermes's own folder.
+  let owner = nousAccount(deps, home)
   if (!owner) {
     if (dryRun) todo('start the Nous sign-in for Hermes on this computer (hermes auth add nous)')
     else if (agent) {
-      const { log } = nousSignInForAgent(deps, hermes)
+      const { log, pid } = nousSignInForAgent(deps, hermes)
       let text = ''
-      for (let i = 0; i < 30 && !/Open:\s*https?:\/\//.test(text); i++) { await deps.sleep(1000); try { text = deps.read(log) } catch {} }
-      // The sign-in may have finished in that time (already approved): carry on with its account.
-      owner = nousAccount(deps)
+      // Until it shows its link, or ends: a sign-in made earlier (another profile's, or the last run's) is imported
+      // without one.
+      for (let i = 0; i < 30 && !/Open:\s*https?:\/\//.test(text) && deps.alive(pid); i++) { await deps.sleep(1000); try { text = deps.read(log) } catch {} }
+      try { text = deps.read(log) } catch {}
+      // The sign-in may have finished in that time (approved, or imported): carry on with its account.
+      owner = nousAccount(deps, home)
       if (!owner) {
         const link = /Open:\s*(https?:\/\/\S+)/.exec(text)?.[1], code = /enter code:\s*(\S+)/.exec(text)?.[1]
-        if (link) throw new NextStep('person', `Sign in to Nous for the computer running Hermes: open ${link}${code ? ` and enter the code ${code}` : ''}. Use your own Nous account, the one you'll sign in with in Hermes HQ.`)
-        throw new NextStep('person', `Sign in to Nous on the computer running Hermes: run "hermes auth add nous" in a terminal there and follow it. (It didn't show a link in time; it said: ${text.trim().split('\n').slice(-3).join(' / ') || 'nothing'})`)
+        if (link && deps.alive(pid)) throw new NextStep('person', `Sign in to Nous for the computer running Hermes: open ${link}${code ? ` and enter the code ${code}` : ''}. Use your own Nous account, the one you'll sign in with in Hermes HQ.`)
+        if (deps.alive(pid)) throw new NextStep('agent', 'Hermes\'s Nous sign-in is still starting. Wait a minute, then run this same command again.')
+        // What it said, without paths: it names its credentials file, which a chat would send along.
+        const said = relayable(text.trim().split('\n').slice(-2).join(' '))
+        throw new NextStep('agent', `Hermes's Nous sign-in ended without signing in${said ? ` (it said: ${said})` : ''}. Run this same command again: it starts the sign-in over. If it ends this way twice, tell the person what it said.`)
       }
     } else {
       say(mac ? '  → Sign in to Nous: a browser window opens. Come back here when you\'re done.'
         : '  → Sign in to Nous: open the link below in any browser (your phone\'s is fine), enter the code, then come back here.')
       deps.run(hermes, ['auth', 'add', 'nous'], { interactive: true, timeoutMs: 15 * 60_000 })
-      owner = nousAccount(deps)
+      owner = nousAccount(deps, home)
       if (!owner) throw new Stop('Hermes isn\'t signed in to Nous yet. Run "hermes auth add nous", sign in, then run this again.')
     }
   }
@@ -462,19 +555,44 @@ export async function setup(deps, { dryRun = false } = {}) {
 
   // 3. Tailscale on this computer (the phone doesn't need it).
   let cli = findTailscale(deps)
-  if (!cli && agent && linux) {
-    // Linux: installed for the person when the agent may use sudo without a password, else one command for them.
-    const root = sudoPrefix(deps)
-    if (!root) throw new NextStep('person', `On the computer running Hermes, run this once in a terminal (it asks for your password), then open the sign-in link it shows: curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --operator=${deps.user}`)
-    todo('Installing Tailscale on this computer')
-    const r = asRoot(deps, root, '/bin/sh', ['-c', 'curl -fsSL https://tailscale.com/install.sh | sh'], { timeoutMs: 10 * 60_000 })
-    if (r.status !== 0) throw new Stop('Installing Tailscale didn\'t finish: ' + (r.stderr || r.stdout).trim().split('\n').slice(-3).join(' / '))
-    cli = findTailscale(deps)
+  const ownCli = ownTailscalePaths(deps).cli
+  // This account's own Tailscale (set up by an earlier run) is one of this setup's services: kept running.
+  if (cli === ownCli && !dryRun) await ownTailscale(deps, jobs, say, todo)
+  if (!cli && linux) {
+    // Root, or an agent's sudo that needs no password: the usual install. Anyone else: Tailscale for this account alone,
+    // which needs no password at all.
+    const root = deps.uid === 0 ? [] : agent ? sudoPrefix(deps) : null
+    if (dryRun) {
+      todo(root ? 'install Tailscale on this computer (tailscale.com/install.sh)' : 'install Tailscale for this account only (no password needed)')
+      say('\nNothing was changed (dry run). The rest needs Tailscale: run this without --dry-run to carry on.')
+      return { dryRun: true }
+    }
+    if (root) {
+      todo('Installing Tailscale on this computer')
+      const r = asRoot(deps, root, '/bin/sh', ['-c', 'curl -fsSL https://tailscale.com/install.sh | sh'], { timeoutMs: 10 * 60_000 })
+      if (r.status !== 0) throw new Stop('Installing Tailscale didn\'t finish: ' + relayable((r.stderr || r.stdout).trim().split('\n').slice(-3).join(' / ')))
+      cli = findTailscale(deps)
+    } else cli = await ownTailscale(deps, jobs, say, todo)
   }
-  if (!cli && agent) throw new NextStep('person', 'Install Tailscale on the Mac running Hermes (not on your phone): https://tailscale.com/download/mac or the Mac App Store. Open it and sign in.')
+  const own = cli === ownCli
+  if (!cli && agent && mac) throw new NextStep('person', 'Install Tailscale on the Mac running Hermes (not on your phone): https://tailscale.com/download/mac or the Mac App Store. Open it and sign in.')
   if (!cli) throw new Stop(mac ? 'Install Tailscale on this Mac (not on your phone): https://tailscale.com/download/mac. Open it, sign in, then run this again.'
     : 'Install Tailscale on this computer (not on your phone): curl -fsSL https://tailscale.com/install.sh | sh, then sudo tailscale up and sign in. Then run this again.')
   let ts = tailscaleState(deps, cli)
+  if (!ts.running && own) {
+    // This account's own Tailscale: signing it in takes only its link, opened in any browser.
+    if (agent) {
+      const link = tailscaleSignInLink(deps, cli)
+      ts = tailscaleState(deps, cli)
+      if (!ts.running && link) throw new NextStep('person', `Sign in to Tailscale for the computer running Hermes (free; your phone doesn't need it): open ${link}`)
+      if (!ts.running) throw new NextStep('agent', 'Tailscale on this computer is still starting. Wait a minute, then run this same command again.')
+    } else {
+      say('  → Sign in to Tailscale (free; your phone doesn\'t need it): open the link below in any browser, then come back here.')
+      deps.run(cli, ['up'], { interactive: true, timeoutMs: 15 * 60_000 })
+      ts = tailscaleState(deps, cli)
+      if (!ts.running) throw new Stop('Tailscale isn\'t signed in yet. Run this again and open the link it shows.')
+    }
+  }
   if (!ts.running && agent) {
     if (mac) throw new NextStep('person', 'Open the Tailscale app on the Mac running Hermes and sign in (it\'s free). Your phone doesn\'t need Tailscale.')
     const root = sudoPrefix(deps)
@@ -502,7 +620,7 @@ export async function setup(deps, { dryRun = false } = {}) {
   const url = publicUrl(ts.dnsName, port)
 
   // 4. Register with Nous for that address (updates in place when already registered).
-  const env = (() => { try { return deps.read(path.join(deps.home, '.hermes/.env')) } catch { return '' } })()
+  const env = (() => { try { return deps.read(path.join(home, '.env')) } catch { return '' } })()
   const registered = /^HERMES_DASHBOARD_OAUTH_CLIENT_ID=agent:/m.test(env) && env.includes(`HERMES_DASHBOARD_PUBLIC_URL=${url}`)
   if (registered) done(`Registered with Nous for ${url}`)
   else if (dryRun) todo(`register this computer with Nous for ${url} (hermes dashboard register)`)
@@ -511,7 +629,7 @@ export async function setup(deps, { dryRun = false } = {}) {
     const named = mac ? deps.run('/usr/sbin/scutil', ['--get', 'ComputerName']).stdout.trim() : String(deps.hostname ?? '').split('.')[0]
     const name = (named || 'my-computer').replace(/[^\w .-]/g, '').slice(0, 40)
     const r = deps.run(hermes, ['dashboard', 'register', '--name', name, '--redirect-uri', `${url}/auth/callback`], { interactive: !agent })
-    if (r.status !== 0) throw new Stop('Registering with Nous didn\'t finish' + (agent ? ': ' + (r.stdout + r.stderr).trim().split('\n').slice(-3).join(' / ') : ' (see above)') + '. Fix that, then run this again.')
+    if (r.status !== 0) throw new Stop('Registering with Nous didn\'t finish' + (agent ? ': ' + relayable((r.stdout + r.stderr).trim().split('\n').slice(-3).join(' / ')) : ' (see above)') + '. Fix that, then run this again.')
   }
 
   // 5. Hermes picks up Nous sign-in on restart; its own sign-in gate must be on.
@@ -602,7 +720,7 @@ export async function setup(deps, { dryRun = false } = {}) {
     if (r.status !== 0 && agent) {
       const allow = /https:\/\/login\.tailscale\.com\/\S+/.exec(r.stdout + r.stderr)?.[0]
       if (allow) throw new NextStep('person', `Allow Tailscale Funnel (your computer's public address) on your Tailscale network: open ${allow} and turn it on.`)
-      throw new Stop('Tailscale didn\'t turn on the public address: ' + (r.stdout + r.stderr).trim().split('\n').slice(-3).join(' / '))
+      throw new Stop('Tailscale didn\'t turn on the public address: ' + relayable((r.stdout + r.stderr).trim().split('\n').slice(-3).join(' / ')))
     }
     if (r.status !== 0) throw new Stop('Tailscale didn\'t turn on the public address (see above). Fix that, then run this again.')
     done(`The public address is on: ${url}`)
@@ -658,6 +776,11 @@ export async function off(deps) {
   if (deps.exists(jobs.file('hermes'))) {
     jobs.remove('hermes')
     say('  ✓ Hermes no longer runs in the background (this setup had started it). Start it yourself any time with: hermes dashboard')
+  }
+  // This account's own Tailscale, if this setup installed it: stopped, kept signed in for a later setup.
+  if (deps.platform === 'linux' && deps.exists(jobs.file('tailscale'))) {
+    jobs.remove('tailscale')
+    say('  ✓ This account\'s own Tailscale is stopped (setting up again starts it, still signed in)')
   }
   say('Your computer is reachable again only the way it was before (Tailscale or your network). Nous registration stays; remove it at https://portal.nousresearch.com/local-dashboards if you like.')
 }
