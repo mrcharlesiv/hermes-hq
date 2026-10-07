@@ -20,6 +20,9 @@
 //   node hermes-hq-connect.mjs --dry-run  say what would change, change nothing
 //   node hermes-hq-connect.mjs status     what's set up
 //   node hermes-hq-connect.mjs off        turn the public address and the gatekeeper off
+//   ... --agent                           for Hermes itself to run (and any run without a terminal): it never waits on a
+//                                         prompt; a step that needs the person prints NEXT STEP (exit 3) with exactly
+//                                         what to relay, and the agent runs it again once that's done, until DONE
 //
 // No dependencies (node >= 20; macOS, or Linux with systemd). Never prints a token: it reads only the Nous account id
 // from Hermes's login.
@@ -27,7 +30,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { qrTerminal } from './qr.mjs'
 
@@ -71,6 +74,18 @@ export function systemDeps() {
     },
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     log: (line = '') => process.stdout.write(line + '\n'),
+    // Hermes running this from its terminal tool has no terminal to prompt in (connect.sh hands one over when there is).
+    agent: process.argv.includes('--agent') || !process.stdin.isTTY,
+    /** A process that outlives this run (the Nous sign-in waiting for its code), its output to `logFile`. */
+    spawnDetached: (cmd, args, logFile) => {
+      fs.mkdirSync(path.dirname(logFile), { recursive: true, mode: 0o700 })
+      const out = fs.openSync(logFile, 'w', 0o600)
+      // Python block-buffers a file: unbuffered, the link and code are in the log as soon as they're printed.
+      const child = spawn(cmd, args, { detached: true, stdio: ['ignore', out, out], env: { ...process.env, PYTHONUNBUFFERED: '1' } })
+      child.unref()
+      return child.pid
+    },
+    alive: (pid) => { try { process.kill(pid, 0); return true } catch { return false } },
   }
 }
 
@@ -233,8 +248,13 @@ function keepRunningAfterLogout(deps, say, dryRun) {
   if (deps.run('loginctl', ['show-user', deps.user, '--property=Linger', '--value']).stdout.trim() === 'yes') return
   if (dryRun) { say(`  • would let your services keep running after you log out (loginctl enable-linger ${deps.user})`); return }
   if (deps.run('loginctl', ['enable-linger', deps.user]).status === 0) return
-  say('  → To keep running after you log out, this needs your password once (sudo loginctl enable-linger).')
-  if (deps.run('sudo', ['loginctl', 'enable-linger', deps.user], { interactive: true }).status === 0) return
+  if (deps.agent) {
+    // No prompt to answer: passwordless sudo, or a warning the agent passes on (Hermes keeps working while logged in).
+    if (deps.run('sudo', ['-n', 'loginctl', 'enable-linger', deps.user]).status === 0) return
+  } else {
+    say('  → To keep running after you log out, this needs your password once (sudo loginctl enable-linger).')
+    if (deps.run('sudo', ['loginctl', 'enable-linger', deps.user], { interactive: true }).status === 0) return
+  }
   say(`  ! Hermes and the gatekeeper will stop when you log out. To keep them running, run: sudo loginctl enable-linger ${deps.user}`)
 }
 
@@ -243,6 +263,10 @@ function tailscaleOperator(deps, cli, say, dryRun) {
   if (deps.platform !== 'linux' || deps.uid === 0) return
   if (deps.run(cli, ['set', `--operator=${deps.user}`]).status === 0) return
   if (dryRun) { say(`  • would let this account manage Tailscale (sudo tailscale set --operator=${deps.user})`); return }
+  if (deps.agent) {
+    if (deps.run('sudo', ['-n', cli, 'set', `--operator=${deps.user}`]).status === 0) return
+    throw new NextStep('person', `On the computer running Hermes, run this once in a terminal (it asks for your password), so Hermes may manage Tailscale there: sudo tailscale set --operator=${deps.user}`)
+  }
   say('  → Tailscale needs your password once (sudo), so this account can turn on the public address.')
   if (deps.run('sudo', [cli, 'set', `--operator=${deps.user}`], { interactive: true }).status !== 0) {
     throw new Stop(`Tailscale didn't give this account access. Run "sudo tailscale set --operator=${deps.user}", then run this again.`)
@@ -339,6 +363,26 @@ export function hermesJob(deps, hermes) {
 // ---- the steps -------------------------------------------------------------------------------------------------
 
 class Stop extends Error { constructor(message, code = 2) { super(message); this.code = code } }
+/** Agent mode: something to do before running again. `forWhom` is 'person' (relay it word for word) or 'agent'. */
+export class NextStep extends Stop { constructor(forWhom, message) { super(message, 3); this.forWhom = forWhom } }
+export const nextStepText = (step) => step.forWhom === 'person'
+  ? `NEXT STEP for the person (send them this, word for word, then wait until they say it's done):\n  ${step.message}\nThen run this same command again.`
+  : `NEXT STEP for you, the agent:\n  ${step.message}\nThen run this same command again.`
+
+/** Root, or sudo that needs no password: the agent can do what would otherwise ask the person for theirs. */
+const sudoPrefix = (deps) => deps.uid === 0 ? [] : deps.run('sudo', ['-n', 'true']).status === 0 ? ['sudo', '-n'] : null
+const asRoot = (deps, prefix, cmd, args, opts) => prefix.length ? deps.run(prefix[0], [...prefix.slice(1), cmd, ...args], opts) : deps.run(cmd, args, opts)
+
+/** Agent mode: Hermes's own Nous sign-in (a device code) started in the background, so its link and code can be passed
+ *  on now and the sign-in finishes while the person approves it. A run while it's still waiting shows the same code. */
+function nousSignInForAgent(deps, hermes) {
+  const dir = edgePaths(deps).dir, log = path.join(dir, 'nous-sign-in.log'), pidFile = path.join(dir, 'nous-sign-in.pid')
+  let pid = 0
+  try { pid = Number(deps.read(pidFile)) } catch {}
+  if (!pid || !deps.alive(pid)) { pid = deps.spawnDetached(hermes, ['auth', 'add', 'nous'], log); deps.write(pidFile, String(pid)) }
+  return { log, pid }
+}
+
 
 export async function setup(deps, { dryRun = false } = {}) {
   const say = (line) => deps.log(line)
@@ -346,14 +390,15 @@ export async function setup(deps, { dryRun = false } = {}) {
   const todo = (line) => say((dryRun ? '  • would ' : '  → ') + line)
   const mac = (deps.platform ?? 'darwin') === 'darwin', linux = deps.platform === 'linux'
   // Windows (outside WSL) has neither LaunchAgents nor systemd: Hermes HQ's Windows steps use Tailscale on the phone.
-  if (!mac && !linux) throw new Stop('This setup runs on a Mac or on Linux. For Hermes on Windows, follow Hermes HQ\'s steps for Windows instead: in Hermes HQ, tap Get Started and choose "On Windows".')
+  if (!mac && !linux) throw new Stop('This setup runs on a Mac or on Linux. For Hermes on Windows, follow Hermes HQ\'s steps for Windows instead: in Hermes HQ, tap Get Started, then Set It Up Myself, then On Windows.')
   const computer = mac ? 'this Mac' : 'this computer'
   const jobs = jobManager(deps)
   // systemd user services keep Hermes and the gatekeeper running; a session without them (su, some containers) can't.
   if (linux && deps.run('systemctl', ['--user', 'show-environment']).status !== 0) {
     throw new Stop('This setup keeps Hermes and its gatekeeper running with systemd user services, which this session can\'t reach. Log in to this computer directly or over SSH (not with su or sudo), then run this again.')
   }
-  say(`Setting up ${computer} for Hermes HQ. It takes a few minutes; you'll be told when to do something.\n`)
+  const agent = Boolean(deps.agent) && !dryRun
+  say(`Setting up ${computer} for Hermes HQ. It takes a few minutes; ${agent ? 'a step that needs the person says NEXT STEP' : 'you\'ll be told when to do something'}.\n`)
 
   // 1. Hermes and its backend: started in the background if none is running.
   const hermes = findHermes(deps)
@@ -394,7 +439,18 @@ export async function setup(deps, { dryRun = false } = {}) {
   let owner = nousAccount(deps)
   if (!owner) {
     if (dryRun) todo('start the Nous sign-in for Hermes on this computer (hermes auth add nous)')
-    else {
+    else if (agent) {
+      const { log } = nousSignInForAgent(deps, hermes)
+      let text = ''
+      for (let i = 0; i < 30 && !/Open:\s*https?:\/\//.test(text); i++) { await deps.sleep(1000); try { text = deps.read(log) } catch {} }
+      // The sign-in may have finished in that time (already approved): carry on with its account.
+      owner = nousAccount(deps)
+      if (!owner) {
+        const link = /Open:\s*(https?:\/\/\S+)/.exec(text)?.[1], code = /enter code:\s*(\S+)/.exec(text)?.[1]
+        if (link) throw new NextStep('person', `Sign in to Nous for the computer running Hermes: open ${link}${code ? ` and enter the code ${code}` : ''}. Use your own Nous account, the one you'll sign in with in Hermes HQ.`)
+        throw new NextStep('person', `Sign in to Nous on the computer running Hermes: run "hermes auth add nous" in a terminal there and follow it. (It didn't show a link in time; it said: ${text.trim().split('\n').slice(-3).join(' / ') || 'nothing'})`)
+      }
+    } else {
       say(mac ? '  → Sign in to Nous: a browser window opens. Come back here when you\'re done.'
         : '  → Sign in to Nous: open the link below in any browser (your phone\'s is fine), enter the code, then come back here.')
       deps.run(hermes, ['auth', 'add', 'nous'], { interactive: true, timeoutMs: 15 * 60_000 })
@@ -405,12 +461,34 @@ export async function setup(deps, { dryRun = false } = {}) {
   if (owner) done('Hermes is signed in to Nous (that account will be the only one allowed in)')
 
   // 3. Tailscale on this computer (the phone doesn't need it).
-  const cli = findTailscale(deps)
+  let cli = findTailscale(deps)
+  if (!cli && agent && linux) {
+    // Linux: installed for the person when the agent may use sudo without a password, else one command for them.
+    const root = sudoPrefix(deps)
+    if (!root) throw new NextStep('person', `On the computer running Hermes, run this once in a terminal (it asks for your password), then open the sign-in link it shows: curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --operator=${deps.user}`)
+    todo('Installing Tailscale on this computer')
+    const r = asRoot(deps, root, '/bin/sh', ['-c', 'curl -fsSL https://tailscale.com/install.sh | sh'], { timeoutMs: 10 * 60_000 })
+    if (r.status !== 0) throw new Stop('Installing Tailscale didn\'t finish: ' + (r.stderr || r.stdout).trim().split('\n').slice(-3).join(' / '))
+    cli = findTailscale(deps)
+  }
+  if (!cli && agent) throw new NextStep('person', 'Install Tailscale on the Mac running Hermes (not on your phone): https://tailscale.com/download/mac or the Mac App Store. Open it and sign in.')
   if (!cli) throw new Stop(mac ? 'Install Tailscale on this Mac (not on your phone): https://tailscale.com/download/mac. Open it, sign in, then run this again.'
     : 'Install Tailscale on this computer (not on your phone): curl -fsSL https://tailscale.com/install.sh | sh, then sudo tailscale up and sign in. Then run this again.')
   let ts = tailscaleState(deps, cli)
+  if (!ts.running && agent) {
+    if (mac) throw new NextStep('person', 'Open the Tailscale app on the Mac running Hermes and sign in (it\'s free). Your phone doesn\'t need Tailscale.')
+    const root = sudoPrefix(deps)
+    if (!root) throw new NextStep('person', `On the computer running Hermes, run this once in a terminal (it asks for your password), then open the sign-in link it shows: sudo tailscale up --operator=${deps.user}`)
+    // `tailscale up` leaves the sign-in link with Tailscale itself: waiting for it is the person's job, not this run's.
+    const r = asRoot(deps, root, cli, ['up', `--operator=${deps.user}`, '--timeout=15s'], { timeoutMs: 30_000 })
+    let auth = /https:\/\/login\.tailscale\.com\/\S+/.exec(r.stdout + r.stderr)?.[0]
+    try { auth ??= JSON.parse(deps.run(cli, ['status', '--json']).stdout).AuthURL || undefined } catch {}
+    ts = tailscaleState(deps, cli)
+    if (!ts.running) throw new NextStep('person', auth ? `Sign in to Tailscale for the computer running Hermes (free; your phone doesn't need it): open ${auth}` : `On the computer running Hermes, run this once in a terminal and open the sign-in link it shows: sudo tailscale up --operator=${deps.user}`)
+  }
   if (!ts.running) throw new Stop(mac ? 'Tailscale is installed but not signed in. Open Tailscale, sign in, then run this again.'
     : 'Tailscale is installed but not signed in. Run sudo tailscale up, sign in, then run this again.')
+  if ((!ts.dnsName || !ts.httpsNames) && agent) throw new NextStep('person', 'Turn on MagicDNS and HTTPS Certificates for your Tailscale network: open https://login.tailscale.com/admin/dns and switch both on.')
   if (!ts.dnsName || !ts.httpsNames) throw new Stop('Turn on MagicDNS and HTTPS Certificates for your tailnet: https://login.tailscale.com/admin/dns (both are one switch each). Then run this again.')
   tailscaleOperator(deps, cli, say, dryRun)
   if (!ts.serveRead) ts = tailscaleState(deps, cli)
@@ -432,8 +510,8 @@ export async function setup(deps, { dryRun = false } = {}) {
     todo(`Registering with Nous for ${url}`)
     const named = mac ? deps.run('/usr/sbin/scutil', ['--get', 'ComputerName']).stdout.trim() : String(deps.hostname ?? '').split('.')[0]
     const name = (named || 'my-computer').replace(/[^\w .-]/g, '').slice(0, 40)
-    const r = deps.run(hermes, ['dashboard', 'register', '--name', name, '--redirect-uri', `${url}/auth/callback`], { interactive: true })
-    if (r.status !== 0) throw new Stop('Registering with Nous didn\'t finish (see above). Fix that, then run this again.')
+    const r = deps.run(hermes, ['dashboard', 'register', '--name', name, '--redirect-uri', `${url}/auth/callback`], { interactive: !agent })
+    if (r.status !== 0) throw new Stop('Registering with Nous didn\'t finish' + (agent ? ': ' + (r.stdout + r.stderr).trim().split('\n').slice(-3).join(' / ') : ' (see above)') + '. Fix that, then run this again.')
   }
 
   // 5. Hermes picks up Nous sign-in on restart; its own sign-in gate must be on.
@@ -443,7 +521,9 @@ export async function setup(deps, { dryRun = false } = {}) {
   else {
     const job = jobs.backendJob(backend)
     if (dryRun) todo(job ? `restart Hermes (${job.name}) so Nous sign-in turns on — open chats pause for a few seconds` : 'ask you to restart Hermes so Nous sign-in turns on')
-    else {
+    else if (!job && agent) {
+      throw new NextStep('agent', `Restart the Hermes web server on ${backend} (the hermes serve or hermes dashboard process) the same way it was started, so it turns Nous sign-in on. If this chat itself runs inside that process, ask the person to restart it instead.`)
+    } else {
       if (job) { todo('Restarting Hermes (open chats pause for a few seconds)'); job.restart() }
       else say('  → Restart Hermes now (stop "hermes dashboard" or "hermes serve" and start it again). Waiting for it…')
       let ok = false
@@ -516,15 +596,26 @@ export async function setup(deps, { dryRun = false } = {}) {
   else if (dryRun) todo(`turn on the public address ${url} (Tailscale Funnel → the gatekeeper)`)
   else {
     todo(`Turning on the public address ${url}`)
-    if (!ts.funnelAllowed) say('    Tailscale may ask you to allow Funnel for this computer: open the link it shows, click Allow, and come back.')
-    const r = deps.run(cli, ['funnel', '--bg', `--https=${port}`, `http://127.0.0.1:${edgePort}`], { interactive: true, timeoutMs: 15 * 60_000 })
+    if (!ts.funnelAllowed && !agent) say('    Tailscale may ask you to allow Funnel for this computer: open the link it shows, click Allow, and come back.')
+    // Agent mode: Tailscale waits for Funnel to be allowed on the tailnet; its link goes to the person instead.
+    const r = deps.run(cli, ['funnel', '--bg', `--https=${port}`, `http://127.0.0.1:${edgePort}`], agent ? { timeoutMs: 30_000 } : { interactive: true, timeoutMs: 15 * 60_000 })
+    if (r.status !== 0 && agent) {
+      const allow = /https:\/\/login\.tailscale\.com\/\S+/.exec(r.stdout + r.stderr)?.[0]
+      if (allow) throw new NextStep('person', `Allow Tailscale Funnel (your computer's public address) on your Tailscale network: open ${allow} and turn it on.`)
+      throw new Stop('Tailscale didn\'t turn on the public address: ' + (r.stdout + r.stderr).trim().split('\n').slice(-3).join(' / '))
+    }
     if (r.status !== 0) throw new Stop('Tailscale didn\'t turn on the public address (see above). Fix that, then run this again.')
     done(`The public address is on: ${url}`)
   }
 
   if (dryRun) { say('\nNothing was changed (dry run).'); return { url, dryRun: true } }
 
-  // 8. The phone.
+  // 8. The phone. An agent passes the address on: a QR code in a chat message is no use.
+  if (agent) {
+    say(`\nDONE. Hermes HQ can reach this computer at: ${url}`)
+    say(`Send the person this address and tell them: in Hermes HQ, paste it into Address, then tap Sign in with Nous with the Nous account this computer's Hermes uses. Keep this computer on${mac ? ' and awake' : ''}.`)
+    return { url, owner: Boolean(owner) }
+  }
   say('\nDone! Now connect your iPhone:')
   say('  1. Open the Camera on your iPhone and point it at this code.')
   say('  2. Tap "Open in Hermes HQ", then tap Sign in with Nous.\n')
@@ -576,9 +667,10 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const command = args.find((a) => !a.startsWith('-')) ?? 'setup'
   const deps = systemDeps()
   // An unknown flag (--help, a typo) prints usage instead of running setup.
-  const work = args.some((a) => a.startsWith('-') && a !== '--dry-run') ? null : command === 'status' ? status(deps) : command === 'off' ? off(deps) : command === 'setup' ? setup(deps, { dryRun: args.includes('--dry-run') }) : null
-  if (!work) { console.error('usage: node hermes-hq-connect.mjs [setup|status|off] [--dry-run]'); process.exit(64) }
+  const work = args.some((a) => a.startsWith('-') && !['--dry-run', '--agent'].includes(a)) ? null : command === 'status' ? status(deps) : command === 'off' ? off(deps) : command === 'setup' ? setup(deps, { dryRun: args.includes('--dry-run') }) : null
+  if (!work) { console.error('usage: node hermes-hq-connect.mjs [setup|status|off] [--dry-run] [--agent]'); process.exit(64) }
   work.catch((error) => {
+    if (error instanceof NextStep) { console.log('\n' + nextStepText(error)); process.exit(error.code) }
     if (error instanceof Stop) { console.error('\n' + error.message); process.exit(error.code) }
     console.error('\nSomething went wrong: ' + (error?.message ?? error)); process.exit(1)
   })

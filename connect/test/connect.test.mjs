@@ -4,7 +4,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { setup, off, status, nousAccount, hermesBackends, choosePort, publicUrl, connectLink } from '../hermes-hq-connect.mjs'
+import { setup, off, status, nousAccount, hermesBackends, choosePort, publicUrl, connectLink, NextStep, nextStepText } from '../hermes-hq-connect.mjs'
 
 const HOME = '/Users/new'
 const jwt = (claims) => ['e30', Buffer.from(JSON.stringify(claims)).toString('base64url'), 'x'.repeat(120)].join('.')
@@ -435,3 +435,102 @@ test('Linux units: the words systemd hands each program are exactly the tool\'s 
   assert.deepEqual([sh, flag], ['/bin/sh', '-c'])
   assert.equal(script, `N="/usr/bin/node"; [ -x "$N" ] || N="$(command -v node)"; [ -x "$N" ] || N="$(ls -d "${LHOME}"/.hermes/tools/node-*/bin/node 2>/dev/null | tail -1)"; exec "$N" "${LHOME}/.config/hermes-hq-edge/hermes-hq-edge.mjs" "${LHOME}/.config/hermes-hq-edge/config.json"`)
 })
+
+// ---- agent mode: Hermes runs the command itself, relays what only the person can do, and runs it again ------------
+
+const SIGN_IN = 'To continue:\n  1. Open: https://portal.nousresearch.com/device\n  2. If prompted, enter code: WXYZ-1234\n'
+/** A machine Hermes is setting up from its own terminal tool: no prompts, a detached Nous sign-in, sudo with or without
+ *  a password, and Funnel that may still need allowing on the tailnet. */
+function asAgent(m, { sudo = false, funnelBlocked = false } = {}) {
+  const spawned = [], live = new Set()
+  const run = m.deps.run
+  m.deps.agent = true
+  m.deps.spawnDetached = (cmd, args, log) => { spawned.push([cmd, ...args].join(' ')); m.files.set(log, SIGN_IN); live.add(4242); return 4242 }
+  m.deps.alive = (pid) => live.has(pid)
+  m.deps.run = (cmd, args, opts = {}) => {
+    if (cmd === 'sudo' && args[0] === '-n') {
+      m.ran.push(['sudo', ...args].join(' '))
+      if (!sudo) return { status: 1, stderr: 'sudo: a password is required' }
+      if (args[1] === 'true') return { status: 0 }
+      // What the machine does for sudo without the prompt.
+      return run('sudo', args.slice(1), opts)
+    }
+    if (funnelBlocked && cmd.endsWith('tailscale') && args[0] === 'funnel' && args[1] === '--bg') {
+      m.ran.push([cmd, ...args].join(' '))
+      return { status: 127, stdout: 'Funnel is not enabled on your tailnet.\nTo enable, visit:\n\n         https://login.tailscale.com/f/funnel?node=nABC\n', stderr: '' }
+    }
+    return run(cmd, args, opts)
+  }
+  const approve = () => { m.files.set(`${m.deps.home}/.hermes/auth.json`, JSON.stringify({ nous: { access_token: jwt({ sub: 'user_owner', iss: 'https://portal.nousresearch.com' }) } })); live.clear() }
+  return { ...m, spawned, approve }
+}
+const nextStep = async (work) => { try { await work } catch (error) { if (error instanceof NextStep) return error; throw error } throw new Error('expected a NEXT STEP') }
+
+test('agent, not signed in to Nous: starts the sign-in in the background and hands the person its link and code', async () => {
+  const m = asAgent(machine({ nous: false }))
+  const step = await nextStep(setup(m.deps))
+  assert.equal(step.code, 3)
+  assert.equal(step.forWhom, 'person')
+  assert.match(step.message, /open https:\/\/portal\.nousresearch\.com\/device and enter the code WXYZ-1234/)
+  assert.deepEqual(m.spawned, ['/x/bin/hermes auth add nous'])
+  assert.ok(!m.ran.some((c) => /register|funnel --bg|bootstrap/.test(c)), 'nothing past the sign-in')
+  // Run again while the person is still signing in: the same code, no second sign-in.
+  assert.match((await nextStep(setup(m.deps))).message, /WXYZ-1234/)
+  assert.equal(m.spawned.length, 1)
+  // Approved: the next run goes all the way.
+  m.approve()
+  const result = await setup(m.deps)
+  assert.equal(result.url, 'https://new-mac.tail1.ts.net')
+})
+
+test('agent, done: the address and what to tell the person, and no QR code in the chat', async () => {
+  const m = asAgent(machine())
+  await setup(m.deps)
+  const out = m.logs.join('\n')
+  assert.match(out, /DONE\. Hermes HQ can reach this computer at: https:\/\/new-mac\.tail1\.ts\.net/)
+  assert.match(out, /paste it into Address, then tap Sign in with Nous/)
+  assert.ok(!out.includes('▀'), 'no QR')
+  assert.ok(!m.ran.some((c) => c.includes('[tty]')))
+})
+
+test('agent, no Tailscale on the Mac: the person gets the install link, nothing else changes', async () => {
+  const m = asAgent(machine({ tailscale: '' }))
+  const step = await nextStep(setup(m.deps))
+  assert.equal(step.forWhom, 'person')
+  assert.match(step.message, /Install Tailscale on the Mac running Hermes \(not on your phone\): https:\/\/tailscale\.com\/download\/mac/)
+  assert.ok(!m.ran.some((c) => /register|funnel --bg/.test(c)))
+})
+
+test('agent, Funnel not yet allowed on the tailnet: Tailscale\'s own link goes to the person', async () => {
+  const m = asAgent(machine({ funnelAllowed: false }), { funnelBlocked: true })
+  const step = await nextStep(setup(m.deps))
+  assert.equal(step.forWhom, 'person')
+  assert.match(step.message, /open https:\/\/login\.tailscale\.com\/f\/funnel\?node=nABC and turn it on/)
+})
+
+test('agent, a Hermes started by hand: the agent restarts it itself (no waiting on a prompt)', async () => {
+  const m = asAgent(machine({ launchAgent: false }))
+  const step = await nextStep(setup(m.deps))
+  assert.equal(step.forWhom, 'agent')
+  assert.match(step.message, /Restart the Hermes web server on 127\.0\.0\.1:9119/)
+  assert.match(nextStepText(step), /^NEXT STEP for you, the agent:/)
+})
+
+test('agent on Linux without a passwordless sudo: one command for the person, run once with their password', async () => {
+  const m = asAgent(linux({ linger: true }))
+  const step = await nextStep(setup(m.deps))
+  assert.equal(step.forWhom, 'person')
+  assert.match(step.message, /sudo tailscale set --operator=ubuntu/)
+  assert.ok(!m.ran.some((c) => c.endsWith('[tty]')), 'no prompt is ever opened')
+  assert.match(nextStepText(step), /^NEXT STEP for the person \(send them this, word for word, then wait until they say it's done\):/)
+})
+
+test('agent on Linux with passwordless sudo: lingering and the Tailscale operator are set without asking anyone', async () => {
+  const m = asAgent(linux({ running: false }), { sudo: true })
+  const result = await setup(m.deps)
+  assert.equal(result.url, 'https://hermes-box.tail1.ts.net')
+  assert.ok(m.ran.includes('sudo -n loginctl enable-linger ubuntu'))
+  assert.ok(m.ran.includes('sudo -n /usr/bin/tailscale set --operator=ubuntu'))
+  assert.ok(!m.ran.some((c) => c.endsWith('[tty]')))
+})
+

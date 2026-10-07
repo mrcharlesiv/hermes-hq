@@ -6,6 +6,14 @@ phone doesn't need Tailscale or a VPN.
 
 ## Set it up
 
+**Easiest: let Hermes do it.** In Hermes HQ, tap **Get Started** and send your Hermes the message the app gives you
+(Telegram, Discord, the Hermes app or its terminal all work). Hermes runs this setup on its own computer with
+`--agent`, which never waits on a prompt: anything only you can do, like signing in to Nous or allowing Funnel, comes
+back to you as a link or one short instruction. When it's done, Hermes sends you an address to paste into Hermes HQ;
+then tap **Sign in with Nous**.
+
+To run it yourself instead:
+
 It works on a Mac or on Linux: a server, a VPS or a box at home, at its own terminal or over SSH. (For Hermes on
 Windows, open Hermes HQ, tap **Get Started** and choose **On Windows**: it uses Tailscale on your phone instead.)
 
@@ -44,7 +52,8 @@ curl -fsSL https://raw.githubusercontent.com/mrcharlesiv/hermes-hq/main/connect.
 ```
 
 That closes the public address, stops the gatekeeper, and stops Hermes running in the background if this setup
-started it. Check what's on with `sh -s -- status`. To see what setup
+started it. Check what's on with `sh -s -- status`. For an agent (or a script), add `--agent`: each run ends in DONE
+with the address, or a NEXT STEP (exit code 3) saying what to do before running it again. To see what setup
 would change without changing anything, use `sh -s -- --dry-run`.
 
 ## What it does, and why it's safe
