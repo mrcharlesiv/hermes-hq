@@ -42,6 +42,11 @@ opens with your computer's address filled in. Tap **Sign in with Nous**, and you
 You can run the same command again at any time. If everything is already set up, it changes nothing. Keep the
 computer on (and a Mac awake): your iPhone can reach Hermes only while it is.
 
+**Updating.** Run the same command again. When a newer gatekeeper is out, it replaces only the gatekeeper and restarts
+it; the address drops for a second or two. The Nous accounts you allowed, your public address and your sign-ins stay
+as they are. The gatekeeper from October 2026 on compresses chat lists and transcripts, so Hermes HQ loads them several
+times faster on a cellular connection.
+
 **Set up before the app was called Hermes HQ?** Run the command again. It moves your setup over to the new names and
 keeps the Nous accounts you allowed, your public address and your sign-ins. The address drops for a second or two
 while the new gatekeeper takes over from the old one.
@@ -67,6 +72,8 @@ would change without changing anything, use `sh -s -- --dry-run`.
 - **Hermes still checks every request itself.** The gatekeeper only narrows what reaches Hermes.
 - **Your chats go only to your computer.** Nous handles the sign-in; your messages never pass through Nous.
 - **Nothing secret is written to logs**, and Hermes HQ keeps your session in the iPhone's Keychain.
+- **Smaller on cellular.** The gatekeeper compresses Hermes's answers (JSON and text) for Hermes HQ, which asks for
+  that itself. Live streams, pictures and audio pass through as Hermes sends them.
 
 Requirements: a Mac, or Linux with systemd, with Hermes installed; a free Nous account; and a free Tailscale account
 for that computer. Your phone needs only Hermes HQ.

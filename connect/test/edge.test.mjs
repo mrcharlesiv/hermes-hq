@@ -7,7 +7,8 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import nodePath from 'node:path'
-import { createEdge, logTarget, normalizeConfig, rotatingLog } from '../hermes-hq-edge.mjs'
+import zlib from 'node:zlib'
+import { acceptsGzip, createEdge, logTarget, normalizeConfig, rotatingLog } from '../hermes-hq-edge.mjs'
 
 const OWNER = 'user_owner_123'
 const TOKENS = { // bearer -> /api/auth/me answer
@@ -31,7 +32,8 @@ function fakeHermes({ gated = true } = {}) {
     req.on('data', (c) => { body += c })
     req.on('end', () => {
       seen.push({ method: req.method, path: url.pathname, search: url.search, headers: req.headers, body })
-      const json = (status, value, headers = {}) => { res.writeHead(status, { 'content-type': 'application/json', ...headers }); res.end(JSON.stringify(value)) }
+      // Like Starlette's JSONResponse: every JSON answer states its length.
+      const json = (status, value, headers = {}) => { const text = JSON.stringify(value); res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text), ...headers }); res.end(text) }
       const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1]
       const me = bearer && TOKENS[bearer]
       switch (url.pathname) {
@@ -68,6 +70,8 @@ function fakeHermes({ gated = true } = {}) {
         }
         case '/api/sessions': return me ? json(200, { sessions: [{ id: 's1' }] }, { 'set-cookie': 'hermes_session_at=renewed' }) : json(401, { error: 'unauthenticated' })
         case '/api/env': return me ? json(200, { OPENAI_API_KEY: 'sk-…' }) : json(401, { error: 'unauthenticated' })
+        // A session list as big as a phone's (rows of titles and previews), for compression.
+        case '/api/big': return me ? json(200, { sessions: Array.from({ length: 200 }, (_, i) => ({ id: `s${i}`, title: `Chat ${i}`, preview: 'The quick brown fox jumps over the lazy dog. '.repeat(4) })) }) : json(401, { error: 'unauthenticated' })
         default: return json(404, { detail: 'Not Found' })
       }
     })
@@ -322,4 +326,49 @@ test('a flood from one address keeps a bounded list (X-17)', async (t) => {
   const { fetchEdge, edge } = await setup(t)
   for (let i = 0; i < 40; i++) await fetchEdge('/api/sessions')
   assert.ok(edge.limits.failures.size('127.0.0.1') <= edge.edgeConfig.failuresPerIpPerMin + 1)
+})
+
+/** One raw request through the edge: status, headers and the undecoded body. */
+function raw(base, path, headers = {}, { firstChunk = false } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(base + path, { headers }, (res) => {
+      const chunks = []
+      res.on('data', (c) => { chunks.push(c); if (firstChunk) { req.destroy(); resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }) } })
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }))
+    })
+    req.on('error', (error) => { if (!firstChunk) reject(error) })
+  })
+}
+
+test('owner answers worth it are gzipped for a client that accepts gzip; nothing else changes (build 205)', async (t) => {
+  const { base } = await setup(t)
+  const auth = { authorization: 'Bearer owner-at' }
+  const plain = await raw(base, '/api/big', auth)
+  assert.equal(plain.headers['content-encoding'], undefined, 'no Accept-Encoding: as Hermes sent it')
+  const packed = await raw(base, '/api/big', { ...auth, 'accept-encoding': 'gzip, deflate, br' })
+  assert.equal(packed.status, 200)
+  assert.equal(packed.headers['content-encoding'], 'gzip')
+  assert.match(String(packed.headers.vary), /Accept-Encoding/)
+  assert.equal(packed.headers['content-length'], undefined, 'the upstream length no longer applies')
+  assert.equal(zlib.gunzipSync(packed.body).toString('utf8'), plain.body.toString('utf8'))
+  assert.ok(packed.body.length * 3 < plain.body.length, `compressed ${packed.body.length} of ${plain.body.length} bytes`)
+  // A small answer, a refused gzip, a stream and a refusal by the edge itself stay plain.
+  assert.equal((await raw(base, '/api/sessions', { ...auth, 'accept-encoding': 'gzip' })).headers['content-encoding'], undefined)
+  assert.equal((await raw(base, '/api/big', { ...auth, 'accept-encoding': 'gzip;q=0, br' })).headers['content-encoding'], undefined)
+  const stream = await raw(base, '/api/stream', { ...auth, 'accept-encoding': 'gzip' }, { firstChunk: true })
+  assert.equal(stream.headers['content-encoding'], undefined)
+  assert.match(stream.body.toString('utf8'), /data: tick/)
+  const refused = await raw(base, '/api/big', { authorization: 'Bearer stranger-at', 'accept-encoding': 'gzip' })
+  assert.equal(refused.status, 403)
+  assert.equal(refused.headers['content-encoding'], undefined)
+})
+
+test('Accept-Encoding is read with its weights (build 205)', () => {
+  assert.equal(acceptsGzip('gzip, deflate, br'), true)
+  assert.equal(acceptsGzip('br;q=1.0, gzip;q=0.8, *;q=0.1'), true)
+  assert.equal(acceptsGzip('gzip;q=0'), false)
+  assert.equal(acceptsGzip('br, *;q=0'), false)
+  assert.equal(acceptsGzip('*'), true)
+  assert.equal(acceptsGzip('identity'), false)
+  assert.equal(acceptsGzip(undefined), false)
 })

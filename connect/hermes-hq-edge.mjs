@@ -16,6 +16,7 @@
 
 import http from 'node:http'
 import net from 'node:net'
+import zlib from 'node:zlib'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import nodePath from 'node:path'
@@ -40,6 +41,14 @@ const UPSTREAM_ANSWER_MS = 300_000
 const ROUTINE = new Set(['owner', 'public', 'ws-relayed'])
 const SUMMARY_MS = 3_600_000
 const LOG_MAX_BYTES = 5 * 1024 * 1024
+// Hermes answers uncompressed, and over Funnel a phone on cellular waits on every byte: transcripts and session lists
+// shrink about 3.5x with gzip. The edge compresses what the phone reads whole (JSON and text of COMPRESS_MIN_BYTES or
+// more) when the client accepts gzip, for owner requests and the public probes. Streams (text/event-stream), media,
+// redirects and anything Hermes already encoded pass through unchanged. Compression next to secrets is the BREACH
+// pattern, which needs an attacker able to make the client send many chosen requests and to watch their sizes; the
+// only client here is the native app with its bearer in a header, which no page can drive.
+const COMPRESSIBLE = /^\s*(application\/(json|[a-z0-9.+-]*\+json|javascript|xml)|text\/(?!event-stream)[a-z0-9.+-]+|image\/svg\+xml)\s*(;|$)/i
+const COMPRESS_MIN_BYTES = 1024
 
 export function loadConfig(file) {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
@@ -144,6 +153,15 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
     return headers
   }
 
+  /** Sends `body` (JSON) gzipped when the client accepts it and it is worth it; plain otherwise. */
+  function sendCompressible(req, res, status, body, extraHeaders = {}) {
+    const text = Buffer.from(JSON.stringify(body))
+    if (res.headersSent || text.length < COMPRESS_MIN_BYTES || !acceptsGzip(req.headers['accept-encoding'])) return send(res, status, body, extraHeaders)
+    const packed = zlib.gzipSync(text, { level: 5 })
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', 'content-encoding': 'gzip', vary: 'Accept-Encoding', 'content-length': packed.length, ...extraHeaders })
+    res.end(packed)
+  }
+
   function send(res, status, body, extraHeaders = {}) {
     if (res.headersSent) return res.end()
     const text = JSON.stringify(body)
@@ -153,15 +171,26 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
 
   /** Streams the request to Hermes and its answer back (no cookies either way unless `keepCookie` allows). The
    *  upstream request ends with the client's: a phone that went away doesn't leave Hermes streaming to nobody. */
-  function proxy(req, res, { path = req.url, bearer = null, cookies = null, keepCookie, decision }) {
+  function proxy(req, res, { path = req.url, bearer = null, cookies = null, keepCookie, decision, compress = false }) {
     let answered = false
     const upstreamReq = client.request({ protocol: cfg.upstream.protocol, hostname: cfg.upstream.hostname, port: cfg.upstream.port,
       method: req.method, path, headers: forwardHeaders(req, { bearer, cookies }) }, (upstreamRes) => {
       answered = true
       clearTimeout(waiting)
-      res.writeHead(upstreamRes.statusCode ?? 502, responseHeaders(upstreamRes, { keepCookie }))
+      const headers = responseHeaders(upstreamRes, { keepCookie })
       upstreamRes.on('error', () => res.destroy())
-      upstreamRes.pipe(res)
+      if (compress && shouldCompress(req, upstreamRes)) {
+        for (const name of Object.keys(headers)) if (name.toLowerCase() === 'content-length') delete headers[name]
+        headers['content-encoding'] = 'gzip'
+        headers.vary = [].concat(headers.vary ?? []).concat('Accept-Encoding').join(', ')
+        res.writeHead(upstreamRes.statusCode ?? 502, headers)
+        const gzip = zlib.createGzip({ level: 5 })
+        gzip.on('error', () => res.destroy())
+        upstreamRes.pipe(gzip).pipe(res)
+      } else {
+        res.writeHead(upstreamRes.statusCode ?? 502, headers)
+        upstreamRes.pipe(res)
+      }
       record(req, upstreamRes.statusCode, decision)
     })
     const waiting = setTimeout(() => {
@@ -169,11 +198,13 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
       send(res, 504, { error: 'upstream_timeout' }); record(req, 504, 'upstream-timeout')
     }, UPSTREAM_ANSWER_MS)
     waiting.unref?.()
-    upstreamReq.on('error', () => {
+    upstreamReq.on('error', (error) => {
       clearTimeout(waiting)
       if (res.writableEnded) return
       if (answered) return res.destroy()
-      send(res, 502, { error: 'upstream_unreachable' }); record(req, 502, 'upstream-error')
+      // The system error code only (ECONNREFUSED, ECONNRESET…): never a message, which could quote an address.
+      const code = typeof error?.code === 'string' && /^[A-Z_]{3,32}$/.test(error.code) ? error.code : 'unknown'
+      send(res, 502, { error: 'upstream_unreachable' }); record(req, 502, 'upstream-error', { code, reused: upstreamReq.reusedSocket === true })
     })
     res.on('close', () => { clearTimeout(waiting); if (!res.writableFinished) upstreamReq.destroy() })
     req.pipe(upstreamReq)
@@ -258,7 +289,7 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
       status.auth_flows = status.auth_providers.length ? ['native_pkce'] : []
     }
     record(req, answer.status, 'public')
-    send(res, answer.status, status, { 'cache-control': 'no-store' })
+    sendCompressible(req, res, answer.status, status, { 'cache-control': 'no-store' })
   }
 
   const server = http.createServer(async (req, res) => {
@@ -268,7 +299,7 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
     try {
       if (gated !== true && !(await checkGate())) { record(req, 503, 'upstream-gate-off'); return send(res, 503, { error: 'gateway_auth_gate_off' }) }
       if (req.method === 'GET' && path === '/api/status' && !url.search) return await publicStatus(req, res)
-      if (req.method === 'GET' && PUBLIC_GET.has(path) && !url.search) return proxy(req, res, { decision: 'public' })
+      if (req.method === 'GET' && PUBLIC_GET.has(path) && !url.search) return proxy(req, res, { decision: 'public', compress: true })
 
       if (req.method === 'GET' && path === '/auth/native/authorize') {
         const provider = url.searchParams.get('provider')
@@ -302,7 +333,7 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
         record(req, check.status, check.status === 403 ? 'not-owner' : 'bad-bearer', check.userId ? { user_id: check.userId, provider: check.provider } : {})
         return send(res, check.status, { error: check.error })
       }
-      return proxy(req, res, { bearer, decision: 'owner' })
+      return proxy(req, res, { bearer, decision: 'owner', compress: true })
     } catch {
       record(req, 500, 'edge-error')
       send(res, 500, { error: 'edge_error' })
@@ -346,6 +377,31 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
   server.limits = { authorize: authorizeLimit, failures: failureLimit }
   server.edgeConfig = cfg
   return server
+}
+
+/** Whether the client takes gzip: listed in Accept-Encoding (or `*`) with a q above zero. */
+export function acceptsGzip(header) {
+  let gzip, star
+  for (const part of String(header ?? '').toLowerCase().split(',')) {
+    const [name, ...params] = part.trim().split(';').map((item) => item.trim())
+    const q = params.map((param) => /^q=([0-9.]+)$/.exec(param)?.[1]).find((value) => value !== undefined)
+    const weight = q === undefined ? 1 : Number(q)
+    if (name === 'gzip' || name === 'x-gzip') gzip = weight
+    else if (name === '*') star = weight
+  }
+  return (gzip ?? star ?? 0) > 0
+}
+
+/** An upstream answer the edge gzips on its way to the client (see COMPRESSIBLE). */
+export function shouldCompress(req, upstreamRes) {
+  if (req.method === 'HEAD') return false
+  const status = upstreamRes.statusCode ?? 0
+  if (status < 200 || status === 204 || status === 206 || status === 304) return false
+  if (upstreamRes.headers['content-encoding'] || upstreamRes.headers['content-range']) return false
+  if (!COMPRESSIBLE.test(String(upstreamRes.headers['content-type'] ?? ''))) return false
+  const length = upstreamRes.headers['content-length']
+  if (length !== undefined && Number(length) < COMPRESS_MIN_BYTES) return false
+  return acceptsGzip(req.headers['accept-encoding'])
 }
 
 function pathOf(raw) { try { return new URL(raw, 'http://edge.invalid').pathname } catch { return '?' } }

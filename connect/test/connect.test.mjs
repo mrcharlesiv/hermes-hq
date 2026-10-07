@@ -96,6 +96,22 @@ test('running it again on a finished computer changes nothing', async () => {
   assert.deepEqual(second, [])
 })
 
+test('running it again with a newer gatekeeper replaces it and reloads its job, and touches nothing else (build 205)', async () => {
+  const m = machine()
+  await setup(m.deps)
+  const script = `${HOME}/.config/hermes-hq-edge/hermes-hq-edge.mjs`
+  const config = m.files.get(`${HOME}/.config/hermes-hq-edge/config.json`)
+  m.files.set(script, '// an older gatekeeper\n')
+  const before = m.ran.length
+  await setup(m.deps)
+  assert.notEqual(m.files.get(script), '// an older gatekeeper\n', 'the new script is in place')
+  assert.equal(m.files.get(`${HOME}/.config/hermes-hq-edge/config.json`), config, 'the owners and ports are kept')
+  const second = m.ran.slice(before).filter((c) => /register|kickstart|bootstrap|funnel --bg|bootout/.test(c))
+  assert.deepEqual(second, ['/bin/launchctl bootout gui/501/com.hermes-hq.edge', `/bin/launchctl bootstrap gui/501 ${HOME}/Library/LaunchAgents/com.hermes-hq.edge.plist`],
+    'only the gatekeeper reloads: no new registration, no Hermes restart, no Funnel change')
+  assert.equal(m.state().edgeLoaded, true)
+})
+
 test('--dry-run says what it would do and changes nothing', async () => {
   const m = machine()
   await setup(m.deps, { dryRun: true })
