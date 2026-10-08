@@ -39,6 +39,11 @@ whenever you log in or the computer starts. It only stops when you have to do so
 When it's done, it shows a **QR code**. Point your iPhone's Camera at it and tap **Open in Hermes HQ**. Hermes HQ
 opens with your computer's address filled in. Tap **Sign in with Nous**, and you're connected.
 
+It also adds a **Hermes HQ theme** to the Hermes desktop app, so desktop can look like the iPhone app: iOS colours,
+blue message bubbles and round shapes, in light and dark. It doesn't switch your theme. To use it, open Settings ›
+Appearance › Theme in the desktop app and pick **Hermes HQ**. (Hermes HQ can also add it from the phone: Settings ›
+Appearance › Theme › Hermes HQ Theme for Desktop.)
+
 You can run the same command again at any time. If everything is already set up, it changes nothing. Keep the
 computer on (and a Mac awake): your iPhone can reach Hermes only while it is.
 

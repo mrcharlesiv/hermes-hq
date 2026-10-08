@@ -4,14 +4,14 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { setup, off, status, nousAccount, hermesHome, hermesBackends, choosePort, publicUrl, connectLink, NextStep, nextStepText, relayable } from '../hermes-hq-connect.mjs'
+import { setup, off, status, nousAccount, hermesHome, desktopTheme, desktopThemePath, hermesBackends, choosePort, publicUrl, connectLink, NextStep, nextStepText, relayable } from '../hermes-hq-connect.mjs'
 
 const HOME = '/Users/new'
 const jwt = (claims) => ['e30', Buffer.from(JSON.stringify(claims)).toString('base64url'), 'x'.repeat(120)].join('.')
 const EDGE_SOURCE = fs.readFileSync(fileURLToPath(new URL('../hermes-hq-edge.mjs', import.meta.url)), 'utf8')
 
 /** A computer: files, processes, Tailscale and Hermes as the tool would find them, and a record of what it did. */
-function machine({ hermes = true, running = true, nous = true, tailscale = 'running', https = true, funnelAllowed = true, serve = {}, env = '', launchAgent = true, platform = 'darwin', hermesStarts = true, old = null, newEdgeStarts = true } = {}) {
+function machine({ hermes = true, running = true, nous = true, tailscale = 'running', https = true, funnelAllowed = true, serve = {}, env = '', launchAgent = true, platform = 'darwin', hermesStarts = true, old = null, newEdgeStarts = true, theme = null } = {}) {
   const files = new Map(), ran = [], logs = [], loaded = new Set(old ? ['com.dispatch.edge'] : [])
   let backendNous = env.includes('OAUTH_CLIENT_ID'), funnel = { ...serve }
   const label = (target) => target.split('/').pop().replace(/\.plist$/, '')
@@ -28,7 +28,7 @@ function machine({ hermes = true, running = true, nous = true, tailscale = 'runn
     home: HOME, uid: 501, node: '/usr/local/bin/node', platform, path: '/opt/homebrew/bin:/usr/bin:/bin',
     which: (name) => (name === 'hermes' && hermes ? '/x/bin/hermes' : name === 'tailscale' && tailscale ? '/x/bin/tailscale' : ''),
     exists: (p) => files.has(p) || p.endsWith('hermes-hq-edge.mjs') && !p.startsWith(HOME),
-    read: (p) => { if (p.endsWith('hermes-hq-edge.mjs') && !p.startsWith(HOME)) return EDGE_SOURCE; if (!files.has(p)) throw new Error('ENOENT ' + p); return files.get(p) },
+    read: (p) => { if (p.endsWith('hermes-hq-edge.mjs') && !p.startsWith(HOME)) return EDGE_SOURCE; if (theme !== null && p.endsWith('hermes-hq-theme.js') && !p.startsWith(HOME)) return theme; if (!files.has(p)) throw new Error('ENOENT ' + p); return files.get(p) },
     write: (p, text) => files.set(p, text),
     copy: (from, to) => files.set(to, EDGE_SOURCE),
     remove: (p) => files.delete(p),
@@ -725,4 +725,51 @@ test('a background Hermes this setup started before it asked for Hermes\'s folde
   const after = restarts()
   await setup(m.deps)
   assert.equal(restarts(), after)
+})
+
+// The Hermes HQ theme for desktop Hermes, added on the way (desktop-plugin/hermes-hq-theme).
+const THEME_FILE = `${HOME}/.hermes/desktop-plugins/hermes-hq-theme/plugin.js`
+
+test('setup adds the Hermes HQ theme to desktop Hermes, says where to pick it, and leaves it alone the next time', async () => {
+  const m = machine({ theme: '// theme v1\n' })
+  await setup(m.deps)
+  assert.equal(m.files.get(THEME_FILE), '// theme v1\n')
+  assert.match(m.logs.join('\n'), /Added the Hermes HQ theme in desktop Hermes \(pick it in Settings › Appearance › Theme\)/)
+  m.logs.length = 0
+  await setup(m.deps)
+  assert.match(m.logs.join('\n'), /✓ The Hermes HQ theme is in desktop Hermes/)
+})
+
+test('a newer theme replaces the installed one; a dry run only says so', async () => {
+  const m = machine({ theme: '// theme v2\n' })
+  m.files.set(THEME_FILE, '// theme v1\n')
+  await setup(m.deps, { dryRun: true })
+  assert.equal(m.files.get(THEME_FILE), '// theme v1\n')
+  assert.match(m.logs.join('\n'), /would update the Hermes HQ theme/)
+  await setup(m.deps)
+  assert.equal(m.files.get(THEME_FILE), '// theme v2\n')
+})
+
+test('no theme file next to the tool (an older download): setup carries on without it', async () => {
+  const m = machine()
+  const result = await setup(m.deps)
+  assert.ok(result.url)
+  assert.equal(m.files.has(THEME_FILE), false)
+})
+
+test('the theme goes to desktop Hermes\'s own folder, never a profile\'s, and a folder it can\'t write holds nothing up', () => {
+  assert.equal(desktopThemePath('/Users/x/.hermes/profiles/inbox'), '/Users/x/.hermes/desktop-plugins/hermes-hq-theme/plugin.js')
+  assert.equal(desktopThemePath('/srv/hermes'), '/srv/hermes/desktop-plugins/hermes-hq-theme/plugin.js')
+  const lines = []
+  desktopTheme({ read: (p) => { if (p.endsWith('hermes-hq-theme.js')) return 'theme'; throw new Error('ENOENT') }, write: () => { throw new Error('EACCES') } },
+    '/Users/x/.hermes', { dryRun: false, done: (l) => lines.push(l), todo: (l) => lines.push(l) })
+  assert.deepEqual(lines, [])
+})
+
+test('the tool finds the theme shipped with it (connect/hermes-hq-theme.js, or desktop-plugin/ in hermes-ios)', () => {
+  const written = new Map()
+  desktopTheme({ read: (p) => fs.readFileSync(p, 'utf8'), write: (p, text) => written.set(p, text) }, '/Users/x/.hermes', { dryRun: false, done: () => {}, todo: () => {} })
+  const shipped = ['../hermes-hq-theme.js', '../../desktop-plugin/hermes-hq-theme/plugin.js'].map((rel) => fileURLToPath(new URL(rel, import.meta.url))).find((p) => fs.existsSync(p))
+  assert.equal(written.get('/Users/x/.hermes/desktop-plugins/hermes-hq-theme/plugin.js'), fs.readFileSync(shipped, 'utf8'))
+  assert.match(written.get('/Users/x/.hermes/desktop-plugins/hermes-hq-theme/plugin.js'), /area: 'themes'/)
 })

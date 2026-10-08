@@ -5,7 +5,8 @@
 //
 //   1. Hermes is installed, and a backend (hermes serve / hermes dashboard) answers. With none running, it starts
 //      `hermes serve` in the background: a LaunchAgent on a Mac, a systemd user service on Linux, both run the way
-//      Hermes's own updater knows how to restart.
+//      Hermes's own updater knows how to restart. The Hermes HQ theme (the phone's look) is added to desktop Hermes
+//      on the way: one more choice under Settings › Appearance › Theme, never switched on for the person.
 //   2. Hermes is signed in to Nous on this computer (if not, it starts the Nous sign-in). Hermes says where its folder
 //      is (a profile's, HERMES_HOME, or ~/.hermes): its sign-in and settings are read there.
 //   3. Tailscale is on this computer, signed in, with HTTPS names and Funnel allowed (it says what to do if not). On
@@ -105,6 +106,36 @@ export function hermesHome(deps, hermes) {
   if (file) return path.dirname(file)
   const env = String(deps.env?.HERMES_HOME ?? '').trim()
   return env ? env.replace(/^~(?=\/|$)/, deps.home) : path.join(deps.home, '.hermes')
+}
+
+/** The Hermes HQ theme's desktop plugin, as published next to this file (connect/), or in hermes-ios's own layout. */
+const THEME_SOURCES = [path.join(HERE, 'hermes-hq-theme.js'), path.join(HERE, '..', 'desktop-plugin', 'hermes-hq-theme', 'plugin.js')]
+
+/** Where desktop Hermes loads the theme from: its app folder's desktop-plugins (never a profile's: desktop plugins
+ *  belong to the app, and it moves profile copies out). `home` may be a profile's folder (…/profiles/<name>). */
+export function desktopThemePath(home) {
+  const root = /\/profiles\/[^/]+\/?$/.test(home) ? home.replace(/\/profiles\/[^/]+\/?$/, '') : home
+  return path.join(root, 'desktop-plugins', 'hermes-hq-theme', 'plugin.js')
+}
+
+/** Adds the Hermes HQ theme (the phone's look) to desktop Hermes on this computer, or brings it up to date. It only
+ *  adds the theme to Settings › Appearance › Theme: the theme in use stays the person's choice. A computer without
+ *  the desktop app just keeps the file. Never stops the setup. */
+export function desktopTheme(deps, home, { dryRun, done, todo }) {
+  let source = null
+  for (const file of THEME_SOURCES) { try { source = deps.read(file); break } catch {} }
+  if (!source) return
+  const target = desktopThemePath(home)
+  const current = (() => { try { return deps.read(target) } catch { return null } })()
+  const where = 'pick it in Settings › Appearance › Theme'
+  if (current === source) return done(`The Hermes HQ theme is in desktop Hermes (${where})`)
+  if (dryRun) return todo(`${current === null ? 'add' : 'update'} the Hermes HQ theme in desktop Hermes`)
+  try {
+    deps.write(target, source, 0o644)
+    done(`${current === null ? 'Added' : 'Updated'} the Hermes HQ theme in desktop Hermes (${where})`)
+  } catch {
+    // A theme is a nicety: a folder this account can't write never holds up the connection.
+  }
 }
 
 /** The Nous account id (JWT `sub`) of Hermes's own Nous login on this computer, or ''. Only the id leaves here. */
@@ -539,6 +570,7 @@ export async function setup(deps, { dryRun = false } = {}) {
     }
   }
   if (running || !dryRun) done(`Hermes is running (${backend})`)
+  desktopTheme(deps, home, { dryRun, done, todo })
 
   // 2. Nous sign-in on this computer: its account becomes the gateway's owner. Read from Hermes's own folder.
   let owner = nousAccount(deps, home)
