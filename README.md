@@ -46,7 +46,7 @@ Appearance › Theme › Hermes HQ Theme for Desktop.)
 
 **Hermes app on a computer that connects to Hermes somewhere else** (a laptop using the Hermes on your desktop or
 server)? Its themes live on the laptop, so setup and the phone can't reach them. Add it from the Hermes app on that
-laptop: **Settings › Plugins › Install from Git**, paste
+laptop: **Settings (the gear) › Plugins › Manage plugins › Install from Git**, paste
 `https://github.com/mrcharlesiv/hermes-hq/tree/main/desktop-plugin/hermes-hq-theme`, and install. Then pick **Hermes
 HQ** in Settings › Appearance › Theme.
 
