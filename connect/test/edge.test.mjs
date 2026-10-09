@@ -8,7 +8,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import nodePath from 'node:path'
 import zlib from 'node:zlib'
-import { acceptsGzip, createEdge, logTarget, normalizeConfig, rotatingLog } from '../hermes-hq-edge.mjs'
+import { acceptsGzip, createEdge, expiredJwt, logTarget, normalizeConfig, rotatingLog } from '../hermes-hq-edge.mjs'
 
 const OWNER = 'user_owner_123'
 const TOKENS = { // bearer -> /api/auth/me answer
@@ -17,9 +17,9 @@ const TOKENS = { // bearer -> /api/auth/me answer
   'fleet-at': { user_id: 'fleet', provider: 'basic', expires_at: Math.floor(Date.now() / 1000) + 900 },
 }
 const CODES = { // native code -> issued session
-  'owner-code': { access_token: 'owner-at', refresh_token: 'owner-rt-1', token_type: 'Bearer', expires_at: 1, provider: 'nous', user_id: OWNER },
-  'stranger-code': { access_token: 'stranger-at', refresh_token: 'stranger-rt', token_type: 'Bearer', expires_at: 1, provider: 'nous', user_id: 'user_someone_else' },
-  'fleet-code': { access_token: 'fleet-at', refresh_token: 'fleet-rt', token_type: 'Bearer', expires_at: 1, provider: 'basic', user_id: 'fleet' },
+  'owner-code': { access_token: 'owner-at', refresh_token: 'owner-rt-1', token_type: 'Bearer', expires_at: Math.floor(Date.now() / 1000) + 900, provider: 'nous', user_id: OWNER },
+  'stranger-code': { access_token: 'stranger-at', refresh_token: 'stranger-rt', token_type: 'Bearer', expires_at: Math.floor(Date.now() / 1000) + 900, provider: 'nous', user_id: 'user_someone_else' },
+  'fleet-code': { access_token: 'fleet-at', refresh_token: 'fleet-rt', token_type: 'Bearer', expires_at: Math.floor(Date.now() / 1000) + 900, provider: 'basic', user_id: 'fleet' },
 }
 
 function fakeHermes({ gated = true } = {}) {
@@ -70,6 +70,7 @@ function fakeHermes({ gated = true } = {}) {
         }
         case '/api/sessions': return me ? json(200, { sessions: [{ id: 's1' }] }, { 'set-cookie': 'hermes_session_at=renewed' }) : json(401, { error: 'unauthenticated' })
         case '/api/env': return me ? json(200, { OPENAI_API_KEY: 'sk-…' }) : json(401, { error: 'unauthenticated' })
+        case '/api/plugins/hermes-hq-push/logs': return me ? json(200, { ok: true, lines: JSON.parse(body || '{}').lines?.length ?? 0, dropped: 0 }) : json(401, { error: 'unauthenticated' })
         // A session list as big as a phone's (rows of titles and previews), for compression.
         case '/api/big': return me ? json(200, { sessions: Array.from({ length: 200 }, (_, i) => ({ id: `s${i}`, title: `Chat ${i}`, preview: 'The quick brown fox jumps over the lazy dog. '.repeat(4) })) }) : json(401, { error: 'unauthenticated' })
         default: return json(404, { detail: 'Not Found' })
@@ -199,6 +200,21 @@ test('owner bearer reaches the API; strangers, fleet tokens and garbage do not',
   assert.ok(!hermes.seen.some((r) => r.path === '/api/env'), 'refused bearers never reach the route')
 })
 
+test("the phone's performance log upload needs an owner's bearer like any other route (Plaid stream E)", async (t) => {
+  const { fetchEdge, hermes } = await setup(t)
+  const route = '/api/plugins/hermes-hq-push/logs'
+  const body = { device: 'iPhone17_1-3f9a0c2e', lines: ['{"t":1,"k":"mem","appMB":300}'] }
+  assert.equal((await fetchEdge(route, post(body))).status, 401, 'no bearer')
+  assert.equal((await fetchEdge(route, post(body, { cookie: 'hermes_session_at=fleet' }))).status, 401, 'a cookie is no sign-in here')
+  assert.equal((await fetchEdge(route, post(body, { authorization: 'Bearer stranger-at' }))).status, 403, 'another Nous account')
+  assert.equal((await fetchEdge(route, post(body, { authorization: 'Bearer fleet-at' }))).status, 403, 'the shared password session')
+  assert.ok(!hermes.seen.some((r) => r.path === route), 'refused uploads never reach Hermes')
+  const ok = await fetchEdge(route, post(body, { authorization: 'Bearer owner-at' }))
+  assert.equal(ok.status, 200)
+  assert.equal((await ok.json()).lines, 1)
+  assert.equal(hermes.seen.filter((r) => r.path === route).at(-1).headers.authorization, 'Bearer owner-at')
+})
+
 test('removing an owner revokes at once (cache never outlives the allowlist)', async (t) => {
   const { fetchEdge, edge } = await setup(t)
   assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200)
@@ -324,8 +340,46 @@ test('a socket upgrade asks again about a gate it last saw off (X-16)', async (t
 
 test('a flood from one address keeps a bounded list (X-17)', async (t) => {
   const { fetchEdge, edge } = await setup(t)
-  for (let i = 0; i < 40; i++) await fetchEdge('/api/sessions')
+  for (let i = 0; i < 70; i++) await fetchEdge('/api/sessions')
+  assert.ok(edge.limits.anonymous.size('127.0.0.1') <= edge.edgeConfig.anonymousPerIpPerMin + 1)
+  for (let i = 0; i < 40; i++) await fetchEdge('/api/sessions', bearer('garbage-' + i))
   assert.ok(edge.limits.failures.size('127.0.0.1') <= edge.edgeConfig.failuresPerIpPerMin + 1)
+})
+
+// Plaid stress round (2026-10-08): Hermes desktop retried each ticket mint with no bearer (its cookie fallback) while
+// the gateway restarted; every 401 counted against the address, so its valid-bearer mints got 429 for four minutes.
+test('requests with no bearer never lock out an owner bearer from the same address', async (t) => {
+  const { fetchEdge } = await setup(t)
+  assert.equal((await fetchEdge('/api/auth/ws-ticket', { method: 'POST', ...bearer('owner-at') })).status, 200) // checked once
+  for (let i = 0; i < 100; i++) await fetchEdge('/api/auth/ws-ticket', { method: 'POST' })
+  const limited = await fetchEdge('/api/auth/ws-ticket', { method: 'POST' })
+  assert.equal(limited.status, 429)
+  assert.equal(limited.headers.get('retry-after'), '30')
+  const minted = await fetchEdge('/api/auth/ws-ticket', { method: 'POST', ...bearer('owner-at') })
+  assert.equal(minted.status, 200)
+  assert.ok((await minted.json()).ticket)
+})
+
+test('an owner bearer the edge already checked is not throttled by bad bearers from its address; unknown ones are', async (t) => {
+  const { fetchEdge } = await setup(t)
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200)
+  for (let i = 0; i < 30; i++) await fetchEdge('/api/sessions', bearer('garbage-' + i))
+  assert.equal((await fetchEdge('/api/sessions', bearer('garbage-x'))).status, 429)
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200)
+})
+
+test('while Hermes is down the edge answers 503 with Retry-After, not 502', async (t) => {
+  const { fetchEdge, hermes } = await setup(t)
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200) // bearer and gate known
+  await new Promise((r) => { hermes.server.close(r); hermes.server.closeAllConnections?.() })
+  const down = await fetchEdge('/api/sessions', bearer('owner-at'))
+  assert.equal(down.status, 503)
+  assert.equal(down.headers.get('retry-after'), '5')
+  assert.deepEqual(await down.json(), { error: 'gateway_unavailable' })
+  // A bearer the edge can't check while Hermes is away: also 503 with Retry-After, and not counted as a failure.
+  const unchecked = await fetchEdge('/api/sessions', bearer('stranger-at'))
+  assert.equal(unchecked.status, 503)
+  assert.equal(unchecked.headers.get('retry-after'), '5')
 })
 
 /** One raw request through the edge: status, headers and the undecoded body. */
@@ -412,4 +466,72 @@ test("the edge's own calls (the public status) are sent once more after the same
   assert.equal(status.status, 200)
   assert.deepEqual(JSON.parse(status.body.toString('utf8')).auth_providers, ['nous'])
   assert.ok(seen.filter((r) => r.path === '/api/status').length >= 2)
+})
+
+// Stability round 2 (N1, 2026-10-09): Hermes desktop woke with an expired access token, its burst of refused calls
+// filled the failures bucket, and the edge then answered its refresh 429 with no Retry-After — so it never refreshed,
+// and retried refresh → 429 → no-bearer → 401 about twice a second for hours.
+const jwt = (claims) => ['{"alg":"RS256","typ":"JWT"}', JSON.stringify(claims), 'sig'].map((part) => Buffer.from(part).toString('base64url')).join('.')
+
+test('refused bearers never lock the same client out of refresh or sign-in (N1)', async (t) => {
+  const { fetchEdge } = await setup(t)
+  for (let i = 0; i < 30; i++) await fetchEdge('/api/sessions', bearer('expired-at'))
+  assert.equal((await fetchEdge('/api/sessions', bearer('garbage-x'))).status, 429, 'guesses are still throttled')
+  const refreshed = await fetchEdge('/auth/native/refresh', post({ refresh_token: 'owner-rt-1' }))
+  assert.equal(refreshed.status, 200)
+  assert.equal((await refreshed.json()).access_token, 'owner-at')
+  assert.equal((await fetchEdge('/auth/native/token', post({ code: 'owner-code', code_verifier: 'v' }))).status, 200)
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200, 'the new token goes straight through')
+})
+
+test('an expired JWT is a client that slept, not a guess: no-bearer bucket, not the failures (N1)', async (t) => {
+  const { fetchEdge, edge, logs } = await setup(t)
+  const stale = jwt({ sub: OWNER, exp: Math.floor(Date.now() / 1000) - 120 })
+  for (let i = 0; i < 40; i++) assert.equal((await fetchEdge('/api/profiles', bearer(stale))).status, 401)
+  assert.equal(edge.limits.failures.size('127.0.0.1'), 0)
+  assert.ok(logs.some((e) => e.decision === 'expired-bearer'))
+  // Past the no-bearer bucket it waits like any anonymous caller, and is told for how long.
+  for (let i = 0; i < 30; i++) await fetchEdge('/api/profiles', bearer(stale))
+  const limited = await fetchEdge('/api/profiles', bearer(stale))
+  assert.equal(limited.status, 429)
+  assert.equal(limited.headers.get('retry-after'), '30')
+  assert.equal((await fetchEdge('/auth/native/refresh', post({ refresh_token: 'owner-rt-1' }))).status, 200)
+  // A token that isn't a JWT, or one not yet expired, is still a failure.
+  assert.equal(expiredJwt(jwt({ exp: Math.floor(Date.now() / 1000) + 600 })), false)
+  assert.equal(expiredJwt('garbage'), false)
+  assert.equal(expiredJwt('a.b.c'), false)
+  assert.equal(expiredJwt(stale), true)
+})
+
+test('the token routes have a small bucket of their own, answered with Retry-After (N1)', async (t) => {
+  let clock = Date.now()
+  const { fetchEdge } = await setup(t, { now: () => clock })
+  for (let i = 0; i < 20; i++) assert.equal((await fetchEdge('/auth/native/refresh', post({ refresh_token: 'revoked' }))).status, 401)
+  const limited = await fetchEdge('/auth/native/refresh', post({ refresh_token: 'owner-rt-1' }))
+  assert.equal(limited.status, 429)
+  const wait = Number(limited.headers.get('retry-after'))
+  assert.ok(wait >= 1 && wait <= 60, `retry-after ${wait}`)
+  // Sign-in is a bucket of its own, and so are owner requests.
+  assert.equal((await fetchEdge('/auth/native/token', post({ code: 'owner-code', code_verifier: 'v' }))).status, 200)
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200)
+  clock += 61_000
+  assert.equal((await fetchEdge('/auth/native/refresh', post({ refresh_token: 'owner-rt-1' }))).status, 200)
+})
+
+test('every 429 and 503 says when to try again (N1)', async (t) => {
+  const { fetchEdge, base, hermes, edge } = await setup(t)
+  let authorize
+  for (let i = 0; i < 13; i++) authorize = await fetchEdge('/auth/native/authorize?provider=nous')
+  assert.equal(authorize.status, 429)
+  assert.ok(Number(authorize.headers.get('retry-after')) >= 1)
+  hermes.state.gated = false
+  assert.equal(await edge.checkGate(), false)
+  const upgrade = await new Promise((resolve) => {
+    const req = http.request(base + '/api/ws?ticket=x', { headers: { connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13' } })
+    req.on('response', (res) => { resolve({ status: res.statusCode, retry: res.headers['retry-after'] }); res.resume() })
+    req.on('upgrade', () => resolve({ status: 101 }))
+    req.on('error', () => resolve({ status: 0 }))
+    req.end()
+  })
+  assert.deepEqual(upgrade, { status: 503, retry: '5' })
 })

@@ -36,7 +36,10 @@ const DROP_RESPONSE = new Set(['connection', 'keep-alive', 'transfer-encoding', 
 const MAX_AUTH_BODY = 16 * 1024
 const AUTH_CACHE_MS = 60_000
 // An upstream that hasn't started answering by then is given up (a stream, once answering, runs as long as it lasts).
+// A read (no body, not asking for an event stream) gets a minute: Hermes answers those in well under a second, and a
+// hung Hermes otherwise held each waiting socket for five minutes. Anything else (a turn, an upload) keeps five.
 const UPSTREAM_ANSWER_MS = 300_000
+const UPSTREAM_READ_ANSWER_MS = 60_000
 // Decisions that are the edge working as meant: counted and logged once an hour, not a line per request.
 const ROUTINE = new Set(['owner', 'public', 'ws-relayed'])
 const SUMMARY_MS = 3_600_000
@@ -56,6 +59,14 @@ const COMPRESS_MIN_BYTES = 1024
 const UPSTREAM_IDLE_MS = 2000
 const RETRY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 const staleConnection = (error, request) => request.reusedSocket === true && (error?.code === 'ECONNRESET' || error?.code === 'EPIPE')
+// While Hermes is down (restarting: nothing listens on its port) the edge says so with 503 and when to try again,
+// so clients back off instead of hammering a dead port (and a 502 isn't read as a broken edge).
+const RETRY_AFTER_DOWN_S = 5
+const DOWN_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ENOTCONN'])
+// Requests with no bearer at all are counted in a bucket of their own, answered 429 once over it: a client
+// retrying without credentials (Hermes desktop's cookie fallback during a gateway restart) never locks out the
+// valid-bearer requests from the same address.
+const RETRY_AFTER_LIMITED_S = 30
 
 export function loadConfig(file) {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
@@ -76,6 +87,8 @@ export function normalizeConfig(raw) {
     provider: raw.provider ?? 'nous',
     authorizePerIpPer10Min: Number(raw.authorizePerIpPer10Min ?? 12),
     failuresPerIpPerMin: Number(raw.failuresPerIpPerMin ?? 30),
+    anonymousPerIpPerMin: Number(raw.anonymousPerIpPerMin ?? 60),
+    tokenPerIpPerMin: Number(raw.tokenPerIpPerMin ?? 20),
   }
 }
 
@@ -94,7 +107,25 @@ function limiter(windowMs, max, now) {
     },
     size(key) { return hits.get(key)?.length ?? 0 },
     over(key) { return (hits.get(key) ?? []).filter((at) => now() - at < windowMs).length >= max },
+    /** Whole seconds until `key` is under its limit again (at least 1). */
+    retryAfter(key) {
+      const t = now(), live = (hits.get(key) ?? []).filter((at) => t - at < windowMs)
+      const freeing = live.length >= max ? live[live.length - max] : t - windowMs
+      return Math.max(1, Math.ceil((freeing + windowMs - t) / 1000))
+    },
   }
+}
+
+/** Whether `token` is a well-formed JWT whose `exp` has passed: a token that was an owner's and expired, refused by
+ *  Hermes for its age rather than a guess. Only read to choose a rate-limit bucket; Hermes still checks every bearer. */
+export function expiredJwt(token, nowMs = Date.now()) {
+  const parts = String(token).split('.')
+  if (parts.length !== 3 || !parts.every((part) => /^[A-Za-z0-9_-]+$/.test(part))) return false
+  try {
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'))
+    const exp = Number(claims?.exp)
+    return Number.isFinite(exp) && exp * 1000 <= nowMs
+  } catch { return false }
 }
 
 export function createEdge(config, { log = defaultLog, now = () => Date.now() } = {}) {
@@ -116,7 +147,19 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
     gated = next
     return gated
   }
+  // Bad credentials (a wrong or stranger's bearer, a blocked route): guards Hermes against guessing.
   const failureLimit = limiter(60_000, cfg.failuresPerIpPerMin, now)
+  // No credentials at all: its own bucket, which never gates a request that carries a bearer.
+  const anonymousLimit = limiter(60_000, cfg.anonymousPerIpPerMin, now)
+  // The sign-in token routes (/auth/native/token, /auth/native/refresh): a small bucket of their own per address and
+  // route, never the failures bucket. A client whose access token expired (and was refused a few dozen times while it
+  // woke up) must always be able to refresh, the one request that ends its 401s (stability round 2, N1).
+  const tokenLimit = limiter(60_000, cfg.tokenPerIpPerMin, now)
+  /** A bearer the edge checked with Hermes in the last minute (an owner's): never throttled for others' failures. */
+  const knownOwner = (token) => {
+    const cached = verified.get(sha(token))
+    return Boolean(cached && cached.until > now() && cfg.owners.has(cached.userId))
+  }
 
   function clientIp(req) {
     const peer = req.socket.remoteAddress ?? ''
@@ -210,15 +253,20 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
         clearTimeout(waiting)
         // The system error code only (ECONNREFUSED, ECONNRESET…): never a message, which could quote an address.
         const code = typeof error?.code === 'string' && /^[A-Z_]{3,32}$/.test(error.code) ? error.code : 'unknown'
+        if (DOWN_CODES.has(code) && !answered) {
+          send(res, 503, { error: 'gateway_unavailable' }, { 'retry-after': String(RETRY_AFTER_DOWN_S) })
+          return record(req, 503, 'upstream-down', { code, reused: sent.reusedSocket === true, retried })
+        }
         send(res, 502, { error: 'upstream_unreachable' }); record(req, 502, 'upstream-error', { code, reused: sent.reusedSocket === true, retried })
       })
       // A read has no body to send (and so can be sent again); anything else streams the client's body through.
       if (RETRY_METHODS.has(req.method)) sent.end(); else req.pipe(sent)
     }
+    const read = RETRY_METHODS.has(req.method) && !/text\/event-stream/i.test(String(req.headers.accept ?? ''))
     const waiting = setTimeout(() => {
       upstreamReq.destroy()
       send(res, 504, { error: 'upstream_timeout' }); record(req, 504, 'upstream-timeout')
-    }, UPSTREAM_ANSWER_MS)
+    }, read ? UPSTREAM_READ_ANSWER_MS : UPSTREAM_ANSWER_MS)
     waiting.unref?.()
     res.on('close', () => { clearTimeout(waiting); if (!res.writableFinished) upstreamReq.destroy() })
     ask(false)
@@ -292,6 +340,12 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
       record(req, 403, 'not-owner', { provider: payload.provider, user_id: String(payload.user_id ?? '') })
       return send(res, 403, { error: 'not_authorized', detail: "This Nous account isn't allowed on this gateway." })
     }
+    // Hermes just minted this access token for an owner: known at once, so the client's next calls aren't held behind
+    // its address's earlier failures (a client that refreshed after a refused burst would otherwise still get 429s).
+    const expiresAt = Number(payload.expires_at) * 1000
+    if (typeof payload.access_token === 'string' && payload.access_token && Number.isFinite(expiresAt) && expiresAt > now()) {
+      verified.set(sha(payload.access_token), { userId: String(payload.user_id), until: Math.min(now() + AUTH_CACHE_MS, expiresAt) })
+    }
     record(req, 200, 'token-issued', { user_id: String(payload.user_id) })
     send(res, 200, payload)
   }
@@ -316,14 +370,14 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
     const path = url.pathname
     const ip = clientIp(req)
     try {
-      if (gated !== true && !(await checkGate())) { record(req, 503, 'upstream-gate-off'); return send(res, 503, { error: 'gateway_auth_gate_off' }) }
+      if (gated !== true && !(await checkGate())) { record(req, 503, 'upstream-gate-off'); return send(res, 503, { error: 'gateway_auth_gate_off' }, { 'retry-after': String(RETRY_AFTER_DOWN_S) }) }
       if (req.method === 'GET' && path === '/api/status' && !url.search) return await publicStatus(req, res)
       if (req.method === 'GET' && PUBLIC_GET.has(path) && !url.search) return proxy(req, res, { decision: 'public', compress: true })
 
       if (req.method === 'GET' && path === '/auth/native/authorize') {
         const provider = url.searchParams.get('provider')
         if (provider && provider !== cfg.provider) { record(req, 403, 'provider-blocked'); return send(res, 403, { error: 'provider_not_allowed' }) }
-        if (authorizeLimit.hit(ip)) { record(req, 429, 'rate-limited'); return send(res, 429, { error: 'rate_limited' }) }
+        if (authorizeLimit.hit(ip)) { record(req, 429, 'rate-limited'); return send(res, 429, { error: 'rate_limited' }, { 'retry-after': String(authorizeLimit.retryAfter(ip)) }) }
         url.searchParams.set('provider', cfg.provider) // never the chooser that offers the password form
         return proxy(req, res, { path: url.pathname + url.search, keepCookie: (name) => PKCE_COOKIE.test(name), decision: 'authorize' })
       }
@@ -334,20 +388,38 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
       }
 
       if (req.method === 'POST' && TOKEN_ROUTES.has(path)) {
-        if (failureLimit.over(ip)) { record(req, 429, 'rate-limited'); return send(res, 429, { error: 'rate_limited' }) }
+        const key = `${path} ${ip}`
+        if (tokenLimit.hit(key)) { record(req, 429, 'token-limited'); return send(res, 429, { error: 'rate_limited' }, { 'retry-after': String(tokenLimit.retryAfter(key)) }) }
         return await tokenRoute(req, res, path)
       }
 
       const auth = String(req.headers.authorization ?? '')
       const bearer = /^Bearer\s+(\S+)$/i.exec(auth)?.[1]
-      if (!bearer || path.startsWith('/auth/') || path === '/login') {
-        failureLimit.hit(ip)
-        record(req, 401, bearer ? 'route-blocked' : 'no-bearer')
+      if (!bearer) {
+        if (anonymousLimit.hit(ip)) { record(req, 429, 'no-bearer-limited'); return send(res, 429, { error: 'rate_limited' }, { 'retry-after': String(RETRY_AFTER_LIMITED_S) }) }
+        record(req, 401, 'no-bearer')
         return send(res, 401, { error: 'unauthenticated' })
       }
-      if (failureLimit.over(ip)) { record(req, 429, 'rate-limited'); return send(res, 429, { error: 'rate_limited' }) }
+      if (path.startsWith('/auth/') || path === '/login') {
+        failureLimit.hit(ip)
+        record(req, 401, 'route-blocked')
+        return send(res, 401, { error: 'unauthenticated' })
+      }
+      // An owner's bearer the edge already checked goes through whatever else this address sent; any other bearer
+      // waits out the address's failures (a guess costs Hermes nothing once the address is over).
+      // A JWT past its exp is a client that slept through its token, not a guess: it waits on the no-bearer bucket
+      // (and isn't held back by, or counted in, the failures), and refreshes.
+      const expired = expiredJwt(bearer, now())
+      if (expired && anonymousLimit.over(ip)) { record(req, 429, 'expired-bearer-limited'); return send(res, 429, { error: 'rate_limited' }, { 'retry-after': String(RETRY_AFTER_LIMITED_S) }) }
+      if (!expired && !knownOwner(bearer) && failureLimit.over(ip)) { record(req, 429, 'rate-limited'); return send(res, 429, { error: 'rate_limited' }, { 'retry-after': String(RETRY_AFTER_LIMITED_S) }) }
       const check = await checkBearer(bearer)
       if (!check.ok) {
+        if (check.status === 503) { record(req, 503, 'auth-unavailable'); return send(res, 503, { error: check.error }, { 'retry-after': String(RETRY_AFTER_DOWN_S) }) }
+        if (expired && check.status === 401) {
+          anonymousLimit.hit(ip)
+          record(req, 401, 'expired-bearer')
+          return send(res, 401, { error: check.error })
+        }
         failureLimit.hit(ip)
         record(req, check.status, check.status === 403 ? 'not-owner' : 'bad-bearer', check.userId ? { user_id: check.userId, provider: check.provider } : {})
         return send(res, check.status, { error: check.error })
@@ -363,7 +435,8 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
     const url = new URL(req.url, 'http://edge.invalid')
     const deny = (status, decision) => {
       record(req, status, decision)
-      socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
+      const retry = status === 503 ? `Retry-After: ${RETRY_AFTER_DOWN_S}\r\n` : ''
+      socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\n${retry}Connection: close\r\nContent-Length: 0\r\n\r\n`)
     }
     // A gate seen off (or not yet) is asked again, as HTTP requests do: a Hermes restart doesn't refuse sockets until the next tick.
     socket.on('error', () => socket.destroy())
@@ -393,7 +466,7 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
   checkGate().catch(() => { gated = false })
   server.on('close', () => { clearInterval(gateTimer); flushRoutine() })
   server.checkGate = checkGate
-  server.limits = { authorize: authorizeLimit, failures: failureLimit }
+  server.limits = { authorize: authorizeLimit, failures: failureLimit, anonymous: anonymousLimit, token: tokenLimit }
   server.edgeConfig = cfg
   return server
 }
