@@ -26,8 +26,10 @@ const PUBLIC_GET = new Set(['/api/health', '/api/status'])
 const TOKEN_ROUTES = new Set(['/auth/native/token', '/auth/native/refresh'])
 // The browser plugin's status list and one bot browser's live view (gateway-plugin/hermes-hq-browser), like the Bot
 // Screen. Gateways still running the plugin under its old name (dispatch-browser) serve the same sockets there.
+// The Terminal page's shell (hermes-hq-push 0.9.25+ /terminal), which Hermes opens only for a valid ticket too.
 const WS_PATHS = [/^\/api\/ws$/, /^\/api\/display\/ws$/, /^\/api\/audio\/[A-Za-z0-9_\-/]+$/,
-  /^\/api\/plugins\/(hermes-hq|dispatch)-browser\/activity$/, /^\/api\/plugins\/(hermes-hq|dispatch)-browser\/sessions\/[0-9a-f]{24}\/watch$/]
+  /^\/api\/plugins\/(hermes-hq|dispatch)-browser\/activity$/, /^\/api\/plugins\/(hermes-hq|dispatch)-browser\/sessions\/[0-9a-f]{24}\/watch$/,
+  /^\/api\/plugins\/hermes-hq-push\/terminal$/]
 const PKCE_COOKIE = /^(__Host-|__Secure-)?hermes_session_pkce$/
 // Client headers never forwarded: hop-by-hop, ambient credentials, and anything that claims a client identity.
 const DROP_REQUEST = new Set(['host', 'cookie', 'authorization', 'connection', 'keep-alive', 'proxy-authorization',

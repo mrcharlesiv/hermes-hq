@@ -274,6 +274,24 @@ test('the browser plugin status and watch sockets pass with a ticket, under its 
   assert.equal((await open(`${wsBase}/api/plugins/other-browser/activity?ticket=${await ticket()}`)).ok, false, 'only the browser plugin')
 })
 
+test('the Terminal socket passes with a ticket; nothing else under the push add-on does', async (t) => {
+  const { fetchEdge, base } = await setup(t)
+  const wsBase = base.replace('http', 'ws')
+  const open = (url) => new Promise((resolve) => {
+    const ws = new WebSocket(url)
+    ws.onmessage = (e) => { resolve({ ok: true, data: String(e.data) }); ws.close() }
+    ws.onerror = () => resolve({ ok: false })
+  })
+  const ticket = async () => (await (await fetchEdge('/api/auth/ws-ticket', { method: 'POST', ...bearer('owner-at') })).json()).ticket
+  const shell = 'session=0123456789abcdef0123456789abcdef&cols=80&rows=24&since=0'
+  assert.deepEqual(await open(`${wsBase}/api/plugins/hermes-hq-push/terminal?${shell}&ticket=${await ticket()}`), { ok: true, data: 'hello from hermes' })
+  assert.equal((await open(`${wsBase}/api/plugins/hermes-hq-push/terminal?${shell}`)).ok, false, 'still needs a ticket')
+  assert.equal((await open(`${wsBase}/api/plugins/hermes-hq-push/terminal?${shell}&token=t&ticket=${await ticket()}`)).ok, false, 'never a session token')
+  assert.equal((await open(`${wsBase}/api/plugins/hermes-hq-push/terminal/x?${shell}&ticket=${await ticket()}`)).ok, false, 'only that one address')
+  assert.equal((await open(`${wsBase}/api/plugins/hermes-hq-push/live?ticket=${await ticket()}`)).ok, false, 'other add-on paths stay closed')
+  assert.equal((await open(`${wsBase}/api/plugins/dispatch-push/terminal?${shell}&ticket=${await ticket()}`)).ok, false, 'only under the add-on\'s own name')
+})
+
 test('with no owners configured every sign-in is refused', async (t) => {
   const { fetchEdge } = await setup(t, { owners: [] })
   assert.equal((await fetchEdge('/auth/native/token', post({ code: 'owner-code', code_verifier: 'v' }))).status, 403)
